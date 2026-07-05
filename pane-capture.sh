@@ -2,8 +2,8 @@
 # Capture the current pane's scrollback (with colors) into a new window, opened
 # in nvim (default) or less. Filters the capture (below) to strip OSC 8
 # hyperlinks so they don't show as literal "]8;…" artifacts.
-#   pane-capture.sh        -> nvim  (bound to prefix j)
-#   pane-capture.sh less   -> less  (bound to prefix P)
+#   pane-capture.sh        -> nvim  (bound to prefix j by omni.tmux)
+#   pane-capture.sh less   -> less  (bound to prefix P by omni.tmux)
 set -euo pipefail
 
 # Remove OSC 8 hyperlink sequences (ESC ]8;… ESC\ … ESC ]8;; ESC\) — e.g. Claude

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fuzzy-search the visible content of every tmux window, then switch to the
-# matching window. Bound to `prefix a` in .tmux.conf (run inside display-popup).
+# matching window. Bound to `prefix a` by omni.tmux (run inside display-popup).
 #
 # Each capture-pane line is prefixed with "session:index<TAB>" so fzf can match
 # on the content (--with-nth=2.. hides the target column) while still letting us

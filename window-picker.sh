@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Fuzzy-jump to any window across all sessions. Bound to `prefix W` in
-# .tmux.conf (run inside display-popup). Leaves the default prefix w
+# Fuzzy-jump to any window across all sessions. Bound to `prefix W` by
+# omni.tmux (run inside display-popup). Leaves the default prefix w
 # (choose-tree) intact.
 #
 # Each row carries choose-tree-like info -- session:index, name, pane count +
