@@ -12,5 +12,5 @@ set -euo pipefail
 
 tmux list-windows -a -F '#{session_name}:#{window_index}  #{window_name}  #{pane_title}  [#{window_panes}p #{pane_current_command}]  #{pane_current_path}' \
   | fzf --reverse --prompt='window> ' \
-      --preview 'tmux capture-pane -ep -t {1}' --preview-window=right:55% \
+      --preview 'tmux capture-pane -ep -t {1}' --preview-window=down:55% \
   | cut -d' ' -f1 | xargs -r tmux switch-client -t

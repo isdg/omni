@@ -16,7 +16,7 @@ sel=$(
   done | fzf --reverse --delimiter='	' --with-nth=2.. \
             --prompt='content> ' \
             --preview 'tmux capture-pane -ep -t {1}' \
-            --preview-window=right:55%
+            --preview-window=down:55%
 ) || exit 0
 
 [ -n "$sel" ] && tmux switch-client -t "${sel%%	*}"
