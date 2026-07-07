@@ -28,6 +28,7 @@ Requires **fzf** on PATH and tmux 3.2+.
 | `prefix a` | fuzzy-search the on-screen *content* of every window, jump to the match |
 | `prefix P` | capture current pane's scrollback into a new window, open in `less` |
 | `prefix j` | capture current pane's scrollback into a new window, open in `nvim` (colors preserved via [baleia.nvim](https://github.com/m00qek/baleia.nvim), if installed) |
+| `prefix J` | same as `j`, but strips colors — plain text in `nvim` |
 
 `prefix w` (choose-tree) is left untouched — `W` is the fzf-powered
 alternative, not a replacement.
