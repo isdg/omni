@@ -17,10 +17,24 @@ strip_osc8() {
 mode="${1:-nvim}"
 f="$(mktemp -t tmux-pane.XXXXXX)"
 
+# Match nvim's initial view to the pane's current scroll position. The full
+# capture below is history_size + pane_height lines; in copy-mode
+# #{scroll_position} is how many lines we're scrolled up from the bottom, so the
+# top visible line is (history_size + 1 - scroll_position). Not in copy-mode ->
+# scroll_position is empty -> jump to the end (G) as before.
+read -r hist sp <<<"$(tmux display-message -p '#{history_size} #{scroll_position}')"
+if [ -n "${sp:-}" ] && [ "${sp:-0}" -gt 0 ]; then
+    top=$(( hist + 1 - sp ))
+    [ "$top" -lt 1 ] && top=1
+    pos="normal! ${top}Gzt"
+else
+    pos='normal! G'
+fi
+
 # plain: capture without escape sequences (drop the -e flag) for colorless text.
 if [ "$mode" = plain ]; then
     tmux capture-pane -p -S - | strip_osc8 > "$f"
-    tmux new-window "nvim -n -c 'set number nowrap' -c 'normal G' '$f'"
+    tmux new-window "nvim -n -c 'set number nowrap' -c '${pos}' '$f'"
     exit 0
 fi
 
@@ -31,5 +45,5 @@ if [ "$mode" = less ]; then
 else
     tmux new-window "nvim -n -c 'set number nowrap' \
         -c 'lua pcall(function() require([[baleia]]).setup().once(0) end)' \
-        -c 'normal G' '$f'"
+        -c '${pos}' '$f'"
 fi
