@@ -54,15 +54,29 @@ env_deny=(
 )
 
 env_args=()
+env_path=""
 if [ -f "$env_file" ]; then
     while IFS= read -r -d '' kv; do
         name="${kv%%=*}"
+        # tmux (3.6) forces the server's PATH onto every new pane and ignores
+        # `-e PATH`, so capture it here and re-apply it on the command line
+        # (a `VAR=val cmd` prefix does stick) — otherwise the venv's bin never
+        # lands on PATH and e.g. the `ty` LSP server can't be found.
+        if [ "$name" = PATH ]; then
+            env_path="${kv#PATH=}"
+            continue
+        fi
         for d in "${env_deny[@]}"; do
             [ "$d" = "$name" ] && continue 2
         done
         env_args+=(-e "$kv")
     done < "$env_file"
 fi
+
+# PATH prefix for the launched command (empty when no snapshot). printf %q keeps
+# it safe for the shell tmux runs the command with.
+cmd_prefix=""
+[ -n "$env_path" ] && cmd_prefix="PATH=$(printf %q "$env_path") "
 if [ -n "${sp:-}" ] && [ "${sp:-0}" -gt 0 ]; then
     top=$(( hist + 1 - sp ))
     [ "$top" -lt 1 ] && top=1
@@ -75,17 +89,17 @@ fi
 if [ "$mode" = plain ]; then
     tmux capture-pane -p -S - | strip_osc8 > "$f"
     tmux new-window -c "$cwd" ${env_args[@]+"${env_args[@]}"} \
-        "nvim -n -c 'set number nowrap' -c '${pos}' '$f'"
+        "${cmd_prefix}nvim -n -c 'set number nowrap' -c '${pos}' '$f'"
     exit 0
 fi
 
 tmux capture-pane -pe -S - | strip_osc8 > "$f"
 
 if [ "$mode" = less ]; then
-    tmux new-window -c "$cwd" ${env_args[@]+"${env_args[@]}"} "less -RN +G '$f'"
+    tmux new-window -c "$cwd" ${env_args[@]+"${env_args[@]}"} "${cmd_prefix}less -RN +G '$f'"
 else
     tmux new-window -c "$cwd" ${env_args[@]+"${env_args[@]}"} \
-        "nvim -n -c 'set number nowrap' \
+        "${cmd_prefix}nvim -n -c 'set number nowrap' \
         -c 'lua pcall(function() require([[baleia]]).setup().once(0) end)' \
         -c '${pos}' '$f'"
 fi
