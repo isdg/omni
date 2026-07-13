@@ -24,18 +24,18 @@ Requires **fzf** on PATH and tmux 3.2+.
 
 | Key | Does |
 |---|---|
-| `prefix W` | fuzzy-jump to any window across all sessions (fzf popup, live preview) |
+| `prefix b` | fuzzy-jump to any window across all sessions, most-recently-active first (fzf popup, live preview) |
 | `prefix a` | fuzzy-search the on-screen *content* of every window, jump to the match |
 | `prefix P` | capture current pane's scrollback into a new window, open in `less` |
 | `prefix j` | capture current pane's scrollback into a new window, open in `nvim` (colors preserved via [baleia.nvim](https://github.com/m00qek/baleia.nvim), if installed) |
 | `prefix J` | same as `j`, but strips colors — plain text in `nvim` |
 
-`prefix w` (choose-tree) is left untouched — `W` is the fzf-powered
+`prefix w` (choose-tree) is left untouched — `b` is the fzf-powered
 alternative, not a replacement.
 
 ## Files
 
 - `omni.tmux` — entry point; binds the four keys above.
-- `window-picker.sh` — `prefix W`.
+- `window-picker.sh` — `prefix b`.
 - `fzf-content.sh` — `prefix a`.
 - `pane-capture.sh` — `prefix P` / `prefix j` (mode selected by argv[1]).
