@@ -26,6 +26,43 @@ read -r hist sp <<<"$(tmux display-message -p '#{history_size} #{scroll_position
 
 # Open the new window in the same working directory as the captured pane.
 cwd="$(tmux display-message -p '#{pane_current_path}')"
+
+# Re-apply the pane shell's exported environment (venv, direnv, exported project
+# vars, …). tmux runs this binding with the server's env, so anything the shell
+# exported interactively is invisible here; the omni zsh hook snapshots it per
+# prompt (see ~/.dotfiles/zsh/omni.zsh — keep this path in sync). Records are
+# NUL-delimited "NAME=VALUE".
+pane_id="$(tmux display-message -p '#{pane_id}')"
+env_file="${XDG_CACHE_HOME:-$HOME/.cache}/omni/env/${pane_id#%}"
+
+# Vars tied to the source pane/terminal — inheriting them would confuse the new
+# window, so skip them. One per line for readable diffs.
+env_deny=(
+    TMUX
+    TMUX_PANE
+    TMUX_TMPDIR
+    TERM
+    TERM_PROGRAM
+    TERM_PROGRAM_VERSION
+    WINDOWID
+    SHLVL
+    PWD
+    OLDPWD
+    COLUMNS
+    LINES
+    _
+)
+
+env_args=()
+if [ -f "$env_file" ]; then
+    while IFS= read -r -d '' kv; do
+        name="${kv%%=*}"
+        for d in "${env_deny[@]}"; do
+            [ "$d" = "$name" ] && continue 2
+        done
+        env_args+=(-e "$kv")
+    done < "$env_file"
+fi
 if [ -n "${sp:-}" ] && [ "${sp:-0}" -gt 0 ]; then
     top=$(( hist + 1 - sp ))
     [ "$top" -lt 1 ] && top=1
@@ -37,16 +74,18 @@ fi
 # plain: capture without escape sequences (drop the -e flag) for colorless text.
 if [ "$mode" = plain ]; then
     tmux capture-pane -p -S - | strip_osc8 > "$f"
-    tmux new-window -c "$cwd" "nvim -n -c 'set number nowrap' -c '${pos}' '$f'"
+    tmux new-window -c "$cwd" ${env_args[@]+"${env_args[@]}"} \
+        "nvim -n -c 'set number nowrap' -c '${pos}' '$f'"
     exit 0
 fi
 
 tmux capture-pane -pe -S - | strip_osc8 > "$f"
 
 if [ "$mode" = less ]; then
-    tmux new-window -c "$cwd" "less -RN +G '$f'"
+    tmux new-window -c "$cwd" ${env_args[@]+"${env_args[@]}"} "less -RN +G '$f'"
 else
-    tmux new-window -c "$cwd" "nvim -n -c 'set number nowrap' \
+    tmux new-window -c "$cwd" ${env_args[@]+"${env_args[@]}"} \
+        "nvim -n -c 'set number nowrap' \
         -c 'lua pcall(function() require([[baleia]]).setup().once(0) end)' \
         -c '${pos}' '$f'"
 fi
