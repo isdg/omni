@@ -2,6 +2,7 @@
 //!
 //!   omni windows   fuzzy-jump to any window across all sessions   (prefix b)
 //!   omni content   fuzzy-search on-screen text of every window     (prefix a)
+//!                  add --history to also search scrollback         (prefix A)
 //!   omni capture   capture this pane's scrollback into a new window (prefix j/J/P)
 //!
 //! The `.tmux` bindings are one-liners that call these; the per-prompt env
@@ -27,7 +28,11 @@ enum Cmd {
     /// Fuzzy-jump to any window across all sessions.
     Windows,
     /// Fuzzy-search the visible content of every window, then switch.
-    Content,
+    Content {
+        /// Also search each window's scrollback history, not just the viewport.
+        #[arg(long)]
+        history: bool,
+    },
     /// Capture the current pane's scrollback into a new window.
     Capture {
         /// Viewer for the captured text.
@@ -49,7 +54,7 @@ enum Pager {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Windows => windows(),
-        Cmd::Content => content(),
+        Cmd::Content { history } => content(history),
         Cmd::Capture { pager } => capture(pager),
     }
 }
@@ -86,16 +91,33 @@ fn windows() -> Result<()> {
 /// Each capture line becomes `session:index<TAB>lineno<TAB>content` so fzf can
 /// match on content (`--with-nth=3..` hides the target + lineno) while still
 /// recovering the target from field 1. Preview centers the matched line ({2}).
-fn content() -> Result<()> {
+///
+/// `history` extends the capture back through scrollback (`-S -`); the preview
+/// uses the same range so its line numbers stay aligned with {2}.
+fn content(history: bool) -> Result<()> {
     let ws = tmux::query([
         "list-windows", "-a", "-F", "#{window_activity} #{session_name}:#{window_index}",
     ])?;
     // strip_activity_sort yields recency order with empty lines already dropped.
     let ordered = strip_activity_sort(&ws);
 
+    // With history, start capture at the beginning of scrollback (-S -); the
+    // preview command below must match so {2} lands on the right line.
+    let cap: &[&str] = if history {
+        &["capture-pane", "-ep", "-S", "-", "-t"]
+    } else {
+        &["capture-pane", "-ep", "-t"]
+    };
+    let preview = if history {
+        "--preview=tmux capture-pane -ep -S - -t {1} | awk -v n={2} 'NR==n{print \"\\033[7m\" $0 \"\\033[0m\"; next}{print}'"
+    } else {
+        "--preview=tmux capture-pane -ep -t {1} | awk -v n={2} 'NR==n{print \"\\033[7m\" $0 \"\\033[0m\"; next}{print}'"
+    };
+
     let mut input = String::new();
     for t in ordered.lines() {
-        let pane = tmux::query(["capture-pane", "-ep", "-t", t]).unwrap_or_default();
+        let args: Vec<&str> = cap.iter().copied().chain([t]).collect();
+        let pane = tmux::query(args).unwrap_or_default();
         for (i, line) in pane.lines().enumerate() {
             input.push_str(&format!("{t}\t{}\t{line}\n", i + 1));
         }
@@ -108,7 +130,7 @@ fn content() -> Result<()> {
             "--delimiter=\t",
             "--with-nth=3..",
             "--prompt=content> ",
-            "--preview=tmux capture-pane -ep -t {1} | awk -v n={2} 'NR==n{print \"\\033[7m\" $0 \"\\033[0m\"; next}{print}'",
+            preview,
             "--preview-window=down:55%:+{2}-/2",
         ],
         input,

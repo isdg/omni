@@ -5,6 +5,7 @@
 # binary (see src/). Bindings:
 #     prefix b  -> fuzzy-jump to any window across all sessions   (omni windows)
 #     prefix a  -> fuzzy-search the on-screen content of windows   (omni content)
+#     prefix A  -> same, but also search each window's scrollback   (omni content --history)
 #     prefix P  -> capture current pane's scrollback -> less       (omni capture)
 #     prefix j  -> capture current pane's scrollback -> nvim
 #     prefix J  -> same as j, but plain text (no colors)
@@ -30,6 +31,7 @@ fi
 
 tmux bind-key b display-popup -E -w 90% -h 75% "$OMNI windows"
 tmux bind-key a display-popup -E -w 90% -h 80% "$OMNI content"
+tmux bind-key A display-popup -E -w 90% -h 80% "$OMNI content --history"
 tmux bind-key P run-shell "$OMNI capture --pager less"
 tmux bind-key j run-shell "$OMNI capture --pager nvim"
 tmux bind-key J run-shell "$OMNI capture --pager plain"
