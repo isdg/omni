@@ -11,7 +11,7 @@
 mod env;
 mod tmux;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use regex::bytes::Regex;
 use std::io::Write;
@@ -26,7 +26,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Fuzzy-jump to any window across all sessions.
-    Windows,
+    Windows {
+        /// Print the window list to stdout instead of launching fzf. Used by the
+        /// picker's ctrl-x binding to refresh the list after killing a window.
+        #[arg(long)]
+        list: bool,
+    },
     /// Fuzzy-search the visible content of every window, then switch.
     Content {
         /// Also search each window's scrollback history, not just the viewport.
@@ -53,7 +58,7 @@ enum Pager {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Windows => windows(),
+        Cmd::Windows { list } => windows(list),
         Cmd::Content { history } => content(history),
         Cmd::Capture { pager } => capture(pager),
     }
@@ -62,21 +67,33 @@ fn main() -> Result<()> {
 /// Rows sorted most-recently-active first: `#{window_activity}` (epoch of last
 /// activity) is prefixed as a numeric sort key, then stripped before fzf.
 /// `--tiebreak=index` keeps that recency order when match scores tie.
-fn windows() -> Result<()> {
-    let raw = tmux::query([
-        "list-windows", "-a", "-F",
-        "#{window_activity} #{session_name}:#{window_index}  #{window_name}  \
-         #{pane_title}  [#{window_panes}p #{pane_current_command}]  #{pane_current_path}",
-    ])?;
-    let input = strip_activity_sort(&raw);
+fn windows(list: bool) -> Result<()> {
+    let input = window_list()?;
+
+    // ctrl-x kills the highlighted window, then reloads via `omni windows --list`
+    // so the row disappears without leaving the picker. `--list` prints exactly
+    // the same rows this fn feeds fzf, so ordering/columns stay identical.
+    if list {
+        println!("{input}");
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe()
+        .context("cannot resolve own path")?
+        .to_string_lossy()
+        .into_owned();
+    // {{1}} -> literal {1} for fzf = first whitespace field = session:index.
+    let kill = format!("--bind=ctrl-x:execute-silent(tmux kill-window -t {{1}})+reload({exe} windows --list)");
 
     if let Some(sel) = tmux::pick(
         &[
             "--reverse",
             "--tiebreak=index",
             "--prompt=window> ",
+            "--header=enter jump · ctrl-x kill",
             "--preview=tmux capture-pane -ep -t {1} | tail -n \"${FZF_PREVIEW_LINES:-40}\"",
             "--preview-window=down:55%",
+            &kill,
         ],
         input,
     )? {
@@ -86,6 +103,17 @@ fn windows() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The recency-ordered window rows fed to the picker (and re-emitted by
+/// `windows --list` after a ctrl-x kill). Field 1 is `session:index`.
+fn window_list() -> Result<String> {
+    let raw = tmux::query([
+        "list-windows", "-a", "-F",
+        "#{window_activity} #{session_name}:#{window_index}  #{window_name}  \
+         #{pane_title}  [#{window_panes}p #{pane_current_command}]  #{pane_current_path}",
+    ])?;
+    Ok(strip_activity_sort(&raw))
 }
 
 /// Each capture line becomes `session:index<TAB>lineno<TAB>content` so fzf can
