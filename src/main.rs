@@ -43,6 +43,10 @@ enum Cmd {
         /// Viewer for the captured text.
         #[arg(long, value_enum, default_value_t = Pager::Nvim)]
         pager: Pager,
+        /// Capture this window/pane target instead of the current pane, first
+        /// switching to it. Used by the picker's ctrl-j binding.
+        #[arg(long)]
+        target: Option<String>,
     },
 }
 
@@ -60,7 +64,7 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Windows { list } => windows(list),
         Cmd::Content { history } => content(history),
-        Cmd::Capture { pager } => capture(pager),
+        Cmd::Capture { pager, target } => capture(pager, target),
     }
 }
 
@@ -84,16 +88,20 @@ fn windows(list: bool) -> Result<()> {
         .into_owned();
     // {{1}} -> literal {1} for fzf = first whitespace field = session:index.
     let kill = format!("--bind=ctrl-x:execute-silent(tmux kill-window -t {{1}})+reload({exe} windows --list)");
+    // ctrl-j captures the highlighted window's pane just like prefix j: switch to
+    // it, then open its scrollback in nvim. +abort leaves the picker afterward.
+    let capture = format!("--bind=ctrl-j:execute-silent({exe} capture --pager nvim --target {{1}})+abort");
 
     if let Some(sel) = tmux::pick(
         &[
             "--reverse",
             "--tiebreak=index",
             "--prompt=window> ",
-            "--header=enter jump · ctrl-x kill",
+            "--header=enter jump · ctrl-x kill · ctrl-j capture",
             "--preview=tmux capture-pane -ep -t {1} | tail -n \"${FZF_PREVIEW_LINES:-40}\"",
             "--preview-window=down:55%",
             &kill,
+            &capture,
         ],
         input,
     )? {
@@ -172,8 +180,32 @@ fn content(history: bool) -> Result<()> {
 
 /// Capture scrollback, strip OSC-8 hyperlinks, re-apply the pane's exported env,
 /// and open the result in nvim/less at the pane's current scroll position.
-fn capture(pager: Pager) -> Result<()> {
-    let disp = tmux::query(["display-message", "-p", "#{history_size} #{scroll_position}"])?;
+///
+/// `target` (ctrl-j in the window picker) captures that window's active pane and
+/// switches to it first, so the capture opens in its session exactly as pressing
+/// prefix j after jumping there would. Without it, the current pane is used.
+fn capture(pager: Pager, target: Option<String>) -> Result<()> {
+    // Enter the picked window first; the new capture window then lands in its
+    // session and reads its scrollback below via the same `-t` target.
+    if let Some(t) = &target {
+        tmux::run(["switch-client", "-t", t])?;
+    }
+    // `-t <target>` steers every read at the picked pane; empty = current pane.
+    let tflag: &[&str] = match &target {
+        Some(t) => &["-t", t.as_str()],
+        None => &[],
+    };
+
+    let dm = |fmt: &str| {
+        let args: Vec<&str> = ["display-message", "-p"]
+            .into_iter()
+            .chain(tflag.iter().copied())
+            .chain([fmt])
+            .collect();
+        tmux::query(args)
+    };
+
+    let disp = dm("#{history_size} #{scroll_position}")?;
     let mut it = disp.split_whitespace();
     let hist: i64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let scroll: Option<i64> = it.next().and_then(|s| s.parse().ok());
@@ -185,14 +217,18 @@ fn capture(pager: Pager) -> Result<()> {
         _ => "normal! G".to_string(),
     };
 
-    let cwd = tmux::query(["display-message", "-p", "#{pane_current_path}"])?;
-    let pane_id = tmux::query(["display-message", "-p", "#{pane_id}"])?;
+    let cwd = dm("#{pane_current_path}")?;
+    let pane_id = dm("#{pane_id}")?;
 
     // plain mode drops color escapes (-p instead of -pe).
-    let cap_args: &[&str] = match pager {
-        Pager::Plain => &["capture-pane", "-p", "-S", "-"],
-        _ => &["capture-pane", "-pe", "-S", "-"],
+    let cap_flag = match pager {
+        Pager::Plain => "-p",
+        _ => "-pe",
     };
+    let cap_args: Vec<&str> = ["capture-pane", cap_flag, "-S", "-"]
+        .into_iter()
+        .chain(tflag.iter().copied())
+        .collect();
     let raw = tmux::query_bytes(cap_args)?;
     let cleaned = strip_osc8(&raw);
 
