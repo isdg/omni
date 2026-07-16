@@ -38,6 +38,11 @@ enum Cmd {
         #[arg(long)]
         history: bool,
     },
+    /// Kill a window, warning instead when it's the last one in its session.
+    Kill {
+        /// The `session:index` window target (fzf field 1) to kill.
+        target: String,
+    },
     /// Capture the current pane's scrollback into a new window.
     Capture {
         /// Viewer for the captured text.
@@ -64,6 +69,7 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Windows { list } => windows(list),
         Cmd::Content { history } => content(history),
+        Cmd::Kill { target } => kill_window(&target),
         Cmd::Capture { pager, target } => capture(pager, target),
     }
 }
@@ -87,7 +93,9 @@ fn windows(list: bool) -> Result<()> {
         .to_string_lossy()
         .into_owned();
     // {{1}} -> literal {1} for fzf = first whitespace field = session:index.
-    let kill = format!("--bind=ctrl-x:execute-silent(tmux kill-window -t {{1}})+reload({exe} windows --list)");
+    // `omni kill` guards the last-window case (would kill the session) with a
+    // warning popup instead; the reload then refreshes the (maybe unchanged) list.
+    let kill = format!("--bind=ctrl-x:execute-silent({exe} kill {{1}})+reload({exe} windows --list)");
     // ctrl-j captures the highlighted window's pane just like prefix j: switch to
     // it, then open its scrollback in nvim. +abort leaves the picker afterward.
     let capture = format!("--bind=ctrl-j:execute-silent({exe} capture --pager nvim --target {{1}})+abort");
@@ -111,6 +119,33 @@ fn windows(list: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Kill `target`, unless it's the only window in its session — killing that
+/// would take the whole session down, so instead pop up a warning and leave it.
+fn kill_window(target: &str) -> Result<()> {
+    let count: i64 = tmux::query(["display-message", "-p", "-t", target, "#{session_windows}"])?
+        .trim()
+        .parse()
+        .unwrap_or(0);
+
+    if count > 1 {
+        return tmux::run(["kill-window", "-t", target]);
+    }
+
+    // Stacked warning popup (tmux ≥3.2) over the picker; `read` holds it open
+    // until Enter, then it closes and control returns to the list.
+    let body = format!(
+        "printf '\\n  \\033[1;33m{target}\\033[0m is the only window in its session.\\n  \
+         Killing it would kill the session — left untouched.\\n\\n  Press Enter to dismiss…'; \
+         read -r _ </dev/tty"
+    );
+    tmux::run([
+        "display-popup", "-E",
+        "-T", " won't kill last window ",
+        "-w", "60%", "-h", "30%",
+        "sh", "-c", &body,
+    ])
 }
 
 /// The recency-ordered window rows fed to the picker (and re-emitted by
