@@ -29,9 +29,9 @@ if [ ! -x "$OMNI" ] || \
     fi
 fi
 
-tmux bind-key b display-popup -E -w 90% -h 75% "$OMNI windows"
-tmux bind-key a display-popup -E -w 90% -h 80% "$OMNI content"
-tmux bind-key A display-popup -E -w 90% -h 80% "$OMNI content --history"
+tmux bind-key b display-popup -E -w 90% -h 100% "$OMNI windows"
+tmux bind-key a display-popup -E -w 90% -h 100% "$OMNI content"
+tmux bind-key A display-popup -E -w 90% -h 100% "$OMNI content --history"
 tmux bind-key P run-shell "$OMNI capture --pager less"
 tmux bind-key j run-shell "$OMNI capture --pager nvim"
 tmux bind-key J run-shell "$OMNI capture --pager plain"
