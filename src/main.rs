@@ -75,7 +75,7 @@ fn windows() -> Result<()> {
             "--reverse",
             "--tiebreak=index",
             "--prompt=window> ",
-            "--preview=tmux capture-pane -ep -t {1}",
+            "--preview=tmux capture-pane -ep -t {1} | tail -n \"${FZF_PREVIEW_LINES:-40}\"",
             "--preview-window=down:55%",
         ],
         input,
