@@ -38,6 +38,11 @@ enum Cmd {
         #[arg(long)]
         history: bool,
     },
+    /// Render a pane for the picker preview (bottom-aligned shell / top TUI).
+    Peek {
+        /// The `session:index` window target (fzf field 1) to preview.
+        target: String,
+    },
     /// Kill a window, warning instead when it's the last one in its session.
     Kill {
         /// The `session:index` window target (fzf field 1) to kill.
@@ -69,6 +74,7 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Windows { list } => windows(list),
         Cmd::Content { history } => content(history),
+        Cmd::Peek { target } => peek(&target),
         Cmd::Kill { target } => kill_window(&target),
         Cmd::Capture { pager, target } => capture(pager, target),
     }
@@ -99,6 +105,10 @@ fn windows(list: bool) -> Result<()> {
     // ctrl-j captures the highlighted window's pane just like prefix j: switch to
     // it, then open its scrollback in nvim. +abort leaves the picker afterward.
     let capture = format!("--bind=ctrl-j:execute-silent({exe} capture --pager nvim --target {{1}})+abort");
+    // `omni peek` renders the pane: shells bottom-aligned (recent output), but
+    // alternate-screen TUIs (k9s/htop/less/nvim) top-down, since they paint from
+    // the top and leave the bottom blank — a plain `tail` would show emptiness.
+    let preview = format!("--preview={exe} peek {{1}}");
 
     if let Some(sel) = tmux::pick(
         &[
@@ -106,7 +116,7 @@ fn windows(list: bool) -> Result<()> {
             "--tiebreak=index",
             "--prompt=window> ",
             "--header=enter jump · ctrl-x kill · ctrl-j capture",
-            "--preview=tmux capture-pane -ep -t {1} | tail -n \"${FZF_PREVIEW_LINES:-40}\"",
+            &preview,
             "--preview-window=down:55%",
             &kill,
             &capture,
@@ -118,6 +128,39 @@ fn windows(list: bool) -> Result<()> {
             tmux::run(["switch-client", "-t", target])?;
         }
     }
+    Ok(())
+}
+
+/// Render a pane's visible screen for the picker preview. A normal shell is
+/// bottom-aligned to the preview height (like `tail`) so the newest output and
+/// prompt show. An alternate-screen TUI (k9s, htop, less, nvim — `alternate_on`)
+/// is shown top-down as painted: those fill from the top and leave the bottom
+/// blank, so a tail would slice the content off and preview an empty screen.
+fn peek(target: &str) -> Result<()> {
+    let raw = tmux::query_bytes(["capture-pane", "-ep", "-t", target])?;
+    let alt = tmux::query(["display-message", "-p", "-t", target, "#{alternate_on}"])?;
+
+    let out = if alt.trim() == "1" {
+        raw
+    } else {
+        // Keep only the last FZF_PREVIEW_LINES lines (fzf exports the preview
+        // height); operate on bytes so SGR color escapes survive intact.
+        let n: usize = std::env::var("FZF_PREVIEW_LINES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        let lines: Vec<&[u8]> = raw.split(|&b| b == b'\n').collect();
+        let start = lines.len().saturating_sub(n);
+        let mut out = Vec::new();
+        for (i, line) in lines[start..].iter().enumerate() {
+            if i > 0 {
+                out.push(b'\n');
+            }
+            out.extend_from_slice(line);
+        }
+        out
+    };
+    std::io::stdout().write_all(&out)?;
     Ok(())
 }
 
