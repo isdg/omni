@@ -288,12 +288,7 @@ fn capture(pager: Pager, target: Option<String>) -> Result<()> {
     let hist: i64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let scroll: Option<i64> = it.next().and_then(|s| s.parse().ok());
 
-    // In copy-mode, scroll_position is lines-from-bottom; the top visible line is
-    // (history_size + 1 - scroll_position). Otherwise jump to the end.
-    let pos = match scroll {
-        Some(sp) if sp > 0 => format!("normal! {}Gzt", (hist + 1 - sp).max(1)),
-        _ => "normal! G".to_string(),
-    };
+    let pos = format!("normal! {}Gzt", top_line(hist, scroll));
 
     let cwd = dm("#{pane_current_path}")?;
     let pane_id = dm("#{pane_id}")?;
@@ -337,6 +332,27 @@ fn capture(pager: Pager, target: Option<String>) -> Result<()> {
     tmux::run(&args)
 }
 
+/// The buffer line a capture should open on: the pane's first visible line, so
+/// the new window shows what the pane shows.
+///
+/// `capture-pane -S -` lays out `history_size` scrollback lines and then the
+/// visible screen, so that line is `history_size + 1` — less `scroll_position`
+/// (lines-from-bottom) when copy-mode has scrolled up.
+///
+/// Anchoring the *top* matters even when the pane isn't scrolled. Capture used to
+/// fall back to `G`, which parks the cursor on the last line and relies on
+/// 'nowrap' for that final screenful to match the pane; once lines wrap, a
+/// screenful of display rows covers fewer buffer lines, so the bottom stops being
+/// a reliable anchor and the pane's own view scrolls off the top.
+fn top_line(hist: i64, scroll: Option<i64>) -> i64 {
+    let top = match scroll {
+        // scroll_position is 0 (or absent) unless copy-mode has scrolled up.
+        Some(sp) if sp > 0 => hist + 1 - sp,
+        _ => hist + 1,
+    };
+    top.max(1)
+}
+
 /// Split lines of `"<activity> <rest>"`, sort by activity descending, and return
 /// the `<rest>` lines joined — the recency-ordered input for fzf.
 fn strip_activity_sort(raw: &str) -> String {
@@ -378,6 +394,20 @@ mod tests {
     #[test]
     fn osc8_noop_when_absent() {
         assert_eq!(strip_osc8(b"plain text"), b"plain text".to_vec());
+    }
+
+    #[test]
+    fn top_line_follows_pane_view() {
+        // Not scrolled: first line of the visible screen, not the end of the file.
+        assert_eq!(top_line(398, None), 399);
+        assert_eq!(top_line(398, Some(0)), 399);
+        // Scrolled up 90 lines in copy-mode.
+        assert_eq!(top_line(398, Some(90)), 309);
+        // Scrolled to the very top, and past it — never below line 1.
+        assert_eq!(top_line(398, Some(398)), 1);
+        assert_eq!(top_line(398, Some(500)), 1);
+        // Empty history: the whole capture is the visible screen.
+        assert_eq!(top_line(0, None), 1);
     }
 
     #[test]
