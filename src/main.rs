@@ -314,11 +314,15 @@ fn capture(pager: Pager, target: Option<String>) -> Result<()> {
     std::fs::File::create(&path)?.write_all(&cleaned)?;
     let path = path.to_string_lossy().into_owned();
 
+    // No `set nowrap`/`set number`: the capture window should read like the
+    // editor you already configured. Forcing nowrap silently clipped the tail of
+    // every full-width line, because the number gutter narrows the text area
+    // below the pane width the content was captured at.
     let shell = match pager {
-        Pager::Plain => format!("nvim -n -c 'set number nowrap' -c '{pos}' '{path}'"),
+        Pager::Plain => format!("nvim -n -c '{pos}' '{path}'"),
         Pager::Less => format!("less -RN +G '{path}'"),
         Pager::Nvim => format!(
-            "nvim -n -c 'set number nowrap' \
+            "nvim -n \
              -c 'lua pcall(function() require([[baleia]]).setup().once(0) end)' \
              -c '{pos}' '{path}'"
         ),
