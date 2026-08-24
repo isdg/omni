@@ -64,7 +64,7 @@ where
 /// It lives here rather than in each picker so the pickers cannot drift apart —
 /// and so any future one is in the same visual language for free. These go in
 /// FIRST, so a caller that repeats an option still wins: fzf takes the last.
-const STYLE: [&str; 9] = [
+const STYLE: [&str; 11] = [
     "--style=minimal",
     // Bottom-up, like nvim's Buffers: the first match sits against the prompt and
     // the list grows upward, so a short list stays under your cursor instead of
@@ -81,6 +81,12 @@ const STYLE: [&str; 9] = [
     "--marker= ",
     "--gutter= ",
     "--prompt=› ",
+    // Key help rides the list's top border as a label. fzf anchors --header to
+    // the prompt, which in this bottom-up layout puts it next to the input; the
+    // help belongs at the top, and a border label is the only thing fzf renders
+    // there. Each picker supplies its own --list-label.
+    "--list-border=top",
+    "--list-label-pos=2",
 ];
 
 /// Pipe `input` into `fzf <args>` and return the selected line, or `None` if the

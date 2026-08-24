@@ -133,9 +133,9 @@ fn windows(list: bool) -> Result<()> {
     // order, and transform-header re-renders the label so it names what you are
     // looking at rather than a fixed action.
     let order = format!(
-        "--bind=ctrl-g:execute-silent({exe} sort --toggle)+reload({exe} windows --list)+transform-header({exe} sort --header)"
+        "--bind=ctrl-g:execute-silent({exe} sort --toggle)+reload({exe} windows --list)+transform-list-label({exe} sort --header)"
     );
-    let header = format!("--header={}", windows_header());
+    let header = format!("--list-label={}", windows_header());
 
     if let Some(sel) = tmux::pick(
         &[
@@ -274,7 +274,7 @@ fn content(history: bool) -> Result<()> {
             // matches against them too — a query spanning a colour change would
             // silently fail. With it, rows look like the screen they came from.
             "--ansi",
-            "--header=content · enter jump",
+            "--list-label= content · enter jump ",
             preview,
             // The +{2}-/2 offset centres the matched line in the preview; it has
             // to ride along with the new border-top, not be replaced by it.
@@ -410,7 +410,7 @@ pub fn order_label(o: Order) -> &'static str {
 /// The window picker's one header line: active order first, then the keys.
 pub fn windows_header() -> String {
     format!(
-        "{} · enter jump · ctrl-g order · ctrl-x kill · ctrl-j capture",
+        " {} · enter jump · ctrl-g order · ctrl-x kill · ctrl-j capture ",
         order_label(order_mode())
     )
 }
