@@ -26,10 +26,26 @@ rebuild automatically). Needs **rust/cargo** for that build.
 
 ## Keys
 
+omni binds **no keys of its own** — it resolves and builds the binary, and the
+key map stays in your `~/.tmux.conf`, where one file owns every binding and a
+plugin update can never move a key underneath you. Paste this after the TPM
+`run` line and adjust to taste:
+
+```tmux
+run-shell 'OMNI="$(command -v omni || echo "$HOME/.cargo/bin/omni")"; \
+  tmux bind-key b display-popup -E -w 90% -h 100% "$OMNI windows"; \
+  tmux bind-key a display-popup -E -w 90% -h 100% "$OMNI content"; \
+  tmux bind-key A display-popup -E -w 90% -h 100% "$OMNI content --history"; \
+  tmux bind-key P run-shell "$OMNI capture --pager less"; \
+  tmux bind-key j run-shell "$OMNI capture --pager nvim"; \
+  tmux bind-key J run-shell "$OMNI capture --pager plain"'
+```
+
 | Key | Does |
 |---|---|
 | `prefix b` | fuzzy-jump to any window across all sessions, most-recently-active first (fzf popup, live preview) |
 | `prefix a` | fuzzy-search the on-screen *content* of every window, jump to the match |
+| `prefix A` | same as `a`, but searches each window's scrollback too |
 | `prefix P` | capture current pane's scrollback into a new window, open in `less` |
 | `prefix j` | capture current pane's scrollback into a new window, open in `nvim` (colors preserved via [baleia.nvim](https://github.com/m00qek/baleia.nvim), if installed) |
 | `prefix J` | same as `j`, but strips colors — plain text in `nvim` |
@@ -39,9 +55,9 @@ alternative, not a replacement.
 
 ## Files
 
-- `omni.tmux` — entry point; resolves/builds the binary and binds the keys.
-- `src/main.rs` — CLI: `omni windows` (`prefix b`), `omni content` (`prefix a`),
-  `omni capture --pager nvim|less|plain` (`prefix j`/`P`/`J`).
+- `omni.tmux` — entry point; resolves and builds the binary. Binds nothing.
+- `src/main.rs` — CLI: `omni windows`, `omni content` (`--history` to include
+  scrollback), `omni capture --pager nvim|less|plain`.
 - `src/tmux.rs` — tmux + fzf helpers.
 - `src/env.rs` — reads the per-pane exported-env snapshot (see below) so a
   captured pane's venv/direnv/exported vars carry into the new window.
