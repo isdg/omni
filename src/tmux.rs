@@ -67,7 +67,9 @@ where
 const STYLE: [&str; 9] = [
     "--style=minimal",
     "--layout=reverse-list",
-    "--info=inline",
+    // inline-right, not inline: the counter is pinned to the right edge, so it
+    // holds one column instead of sliding rightward as the query grows.
+    "--info=inline-right",
     "--no-scrollbar",
     "--pointer=›",
     "--marker= ",
