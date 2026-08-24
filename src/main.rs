@@ -32,6 +32,16 @@ enum Cmd {
         #[arg(long)]
         list: bool,
     },
+    /// Show or flip the window picker's order: recency (default) or session.
+    /// The choice persists, so ctrl-g's reload comes back in the new order.
+    Sort {
+        /// Flip to the other order and print the new one.
+        #[arg(long)]
+        toggle: bool,
+        /// Print the picker's full header line instead of just the mode.
+        #[arg(long)]
+        header: bool,
+    },
     /// Fuzzy-search the visible content of every window, then switch.
     Content {
         /// Also search each window's scrollback history, not just the viewport.
@@ -73,6 +83,15 @@ enum Pager {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Windows { list } => windows(list),
+        Cmd::Sort { toggle, header } => {
+            let mode = if toggle { toggle_order() } else { order_mode() };
+            if header {
+                println!("{}", windows_header());
+            } else {
+                println!("{}", order_label(mode));
+            }
+            Ok(())
+        }
         Cmd::Content { history } => content(history),
         Cmd::Peek { target } => peek(&target),
         Cmd::Kill { target } => kill_window(&target),
@@ -109,11 +128,20 @@ fn windows(list: bool) -> Result<()> {
     // alternate-screen TUIs (k9s/htop/less/nvim) top-down, since they paint from
     // the top and leave the bottom blank — a plain `tail` would show emptiness.
     let preview = format!("--preview={exe} peek {{1}}");
+    // ctrl-g flips recency <-> session order. The mode is persisted, so the
+    // reload it triggers (a fresh `omni windows --list`) comes back in the new
+    // order, and transform-header re-renders the label so it names what you are
+    // looking at rather than a fixed action.
+    let order = format!(
+        "--bind=ctrl-g:execute-silent({exe} sort --toggle)+reload({exe} windows --list)+transform-header({exe} sort --header)"
+    );
+    let header = format!("--header={}", windows_header());
 
     if let Some(sel) = tmux::pick(
         &[
             "--tiebreak=index",
-            "--header=windows · enter jump · ctrl-x kill · ctrl-j capture",
+            &header,
+            &order,
             &preview,
             "--preview-window=down,55%,border-top",
             &kill,
@@ -194,10 +222,10 @@ fn kill_window(target: &str) -> Result<()> {
 fn window_list() -> Result<String> {
     let raw = tmux::query([
         "list-windows", "-a", "-F",
-        "#{window_activity} #{session_name}:#{window_index}  #{window_name}  \
+        "#{window_activity} #{session_last_attached} #{session_name}:#{window_index}  #{window_name}  \
          #{pane_title}  [#{window_panes}p #{pane_current_command}]  #{pane_current_path}",
     ])?;
-    Ok(strip_activity_sort(&raw))
+    Ok(strip_sort_keys(&raw, order_mode()))
 }
 
 /// Each capture line becomes `session:index<TAB>lineno<TAB>content` so fzf can
@@ -208,10 +236,11 @@ fn window_list() -> Result<String> {
 /// uses the same range so its line numbers stay aligned with {2}.
 fn content(history: bool) -> Result<()> {
     let ws = tmux::query([
-        "list-windows", "-a", "-F", "#{window_activity} #{session_name}:#{window_index}",
+        "list-windows", "-a", "-F",
+        "#{window_activity} #{session_last_attached} #{session_name}:#{window_index}",
     ])?;
-    // strip_activity_sort yields recency order with empty lines already dropped.
-    let ordered = strip_activity_sort(&ws);
+    // Content search always reads recency-first: it is "what did I just see?".
+    let ordered = strip_sort_keys(&ws, Order::Recency);
 
     // With history, start capture at the beginning of scrollback (-S -); the
     // preview command below must match so {2} lands on the right line.
@@ -359,18 +388,82 @@ fn top_line(hist: i64, scroll: Option<i64>) -> i64 {
 
 /// Split lines of `"<activity> <rest>"`, sort by activity descending, and return
 /// the `<rest>` lines joined — the recency-ordered input for fzf.
-fn strip_activity_sort(raw: &str) -> String {
-    let mut rows: Vec<(i64, &str)> = raw
+/// Which order the window picker is showing. Persisted, because ctrl-g reloads
+/// through a fresh `omni windows --list` process — a mode held inside fzf would
+/// not survive the reload it triggers.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Order {
+    /// Most recently active first. The default: it answers "where was I?".
+    Recency,
+    /// tmux's own order — session name, then window index. Stable and
+    /// predictable, which is what you want when you know the name you are after.
+    Session,
+}
+
+pub fn order_label(o: Order) -> &'static str {
+    match o {
+        Order::Recency => "recency",
+        Order::Session => "session",
+    }
+}
+
+/// The window picker's one header line: active order first, then the keys.
+pub fn windows_header() -> String {
+    format!(
+        "{} · enter jump · ctrl-g order · ctrl-x kill · ctrl-j capture",
+        order_label(order_mode())
+    )
+}
+
+fn order_path() -> String {
+    let tmp = std::env::var("TMPDIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/tmp".into());
+    format!("{}/omni.order", tmp.trim_end_matches('/'))
+}
+
+pub fn order_mode() -> Order {
+    match std::fs::read_to_string(order_path()).as_deref().map(str::trim) {
+        Ok("session") => Order::Session,
+        _ => Order::Recency,
+    }
+}
+
+pub fn toggle_order() -> Order {
+    let next = match order_mode() {
+        Order::Recency => Order::Session,
+        Order::Session => Order::Recency,
+    };
+    let _ = std::fs::write(order_path(), order_label(next));
+    next
+}
+
+/// Strip the two leading numeric sort keys, ordering rows by `mode`.
+///
+/// Two keys, not one, because `#{window_activity}` alone ties constantly: any
+/// pane running an animated TUI (a Claude Code spinner, k9s) bumps its activity
+/// every second, so a dozen windows share the same timestamp and the sort — being
+/// stable — silently degenerates to tmux's listing order. The session's
+/// last-attached time breaks those ties, so windows in the session you were
+/// actually in come first.
+fn strip_sort_keys(raw: &str, mode: Order) -> String {
+    let mut rows: Vec<(i64, i64, &str)> = raw
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| {
             let (a, rest) = l.split_once(' ').unwrap_or(("0", l));
-            (a.parse::<i64>().unwrap_or(0), rest)
+            let (b, rest) = rest.split_once(' ').unwrap_or(("0", rest));
+            (a.parse().unwrap_or(0), b.parse().unwrap_or(0), rest)
         })
         .collect();
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    // Session order is tmux's own listing order, so leave it alone; only recency
+    // reorders. Both drop the keys.
+    if mode == Order::Recency {
+        rows.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| y.1.cmp(&x.1)));
+    }
     rows.into_iter()
-        .map(|(_, r)| r)
+        .map(|(_, _, r)| r)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -415,8 +508,32 @@ mod tests {
     }
 
     #[test]
-    fn activity_sort_is_descending_and_strips_key() {
-        let raw = "100 alpha\n300 gamma\n200 beta\n";
-        assert_eq!(strip_activity_sort(raw), "gamma\nbeta\nalpha");
+    fn recency_is_descending_and_strips_both_keys() {
+        let raw = "100 1 alpha\n300 1 gamma\n200 1 beta\n";
+        assert_eq!(strip_sort_keys(raw, Order::Recency), "gamma\nbeta\nalpha");
+    }
+
+    #[test]
+    fn session_last_attached_breaks_an_activity_tie() {
+        // The case that matters in practice: animated panes (a Claude spinner,
+        // k9s) all stamp the same activity second, so the first key ties and the
+        // session you were last in has to decide.
+        let raw = "500 10 old-session\n500 90 recent-session\n500 50 mid-session\n";
+        assert_eq!(
+            strip_sort_keys(raw, Order::Recency),
+            "recent-session\nmid-session\nold-session"
+        );
+    }
+
+    #[test]
+    fn session_order_keeps_tmux_listing_order_and_still_strips_keys() {
+        let raw = "100 1 alpha\n300 9 gamma\n200 5 beta\n";
+        assert_eq!(strip_sort_keys(raw, Order::Session), "alpha\ngamma\nbeta");
+    }
+
+    #[test]
+    fn a_missing_second_key_degrades_without_eating_the_row() {
+        // Defensive: a one-key line must still yield its content, not swallow it.
+        assert_eq!(strip_sort_keys("100 alpha\n", Order::Recency), "alpha");
     }
 }

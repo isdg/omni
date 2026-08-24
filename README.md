@@ -43,12 +43,25 @@ run-shell 'OMNI="$(command -v omni || echo "$HOME/.cargo/bin/omni")"; \
 
 | Key | Does |
 |---|---|
-| `prefix b` | fuzzy-jump to any window across all sessions, most-recently-active first (fzf popup, live preview) |
+| `prefix b` | fuzzy-jump to any window across all sessions, most-recently-active first; `ctrl-g` toggles to session order (fzf popup, live preview) |
 | `prefix a` | fuzzy-search the on-screen *content* of every window, jump to the match |
 | `prefix A` | same as `a`, but searches each window's scrollback too |
 | `prefix P` | capture current pane's scrollback into a new window, open in `less` |
 | `prefix j` | capture current pane's scrollback into a new window, open in `nvim` (colors preserved via [baleia.nvim](https://github.com/m00qek/baleia.nvim), if installed) |
 | `prefix J` | same as `j`, but strips colors — plain text in `nvim` |
+
+### Window order
+
+The window picker opens **recency first** and `ctrl-g` toggles to **session
+order** (tmux's own: session name, then window index). The header names the
+active one, and the choice persists.
+
+Recency sorts on `#{window_activity}`, then on the session's last-attached time.
+The second key is not decoration: any pane running an animated TUI — a Claude
+Code spinner, k9s — restamps its activity every second, so a dozen windows tie on
+the first key and a stable sort quietly degenerates into tmux's listing order.
+Breaking the tie by the session you were last in is what makes recency mean
+anything on a busy server.
 
 Both pickers share one layout — list on top, the input line under it, preview
 below, the shape of nvim's buffer picker — with fzf's chrome stripped to a single
