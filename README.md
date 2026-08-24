@@ -50,6 +50,11 @@ run-shell 'OMNI="$(command -v omni || echo "$HOME/.cargo/bin/omni")"; \
 | `prefix j` | capture current pane's scrollback into a new window, open in `nvim` (colors preserved via [baleia.nvim](https://github.com/m00qek/baleia.nvim), if installed) |
 | `prefix J` | same as `j`, but strips colors — plain text in `nvim` |
 
+Both pickers share one layout — list on top, the input line under it, preview
+below, the shape of nvim's buffer picker — with fzf's chrome stripped to a single
+pointer on the current row. It lives in `tmux::pick`, so every picker wears it and
+a new one gets it for free.
+
 `prefix w` (choose-tree) is left untouched — `b` is the fzf-powered
 alternative, not a replacement.
 

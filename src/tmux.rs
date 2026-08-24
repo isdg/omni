@@ -52,11 +52,35 @@ where
     Ok(())
 }
 
+/// The chrome every omni picker wears: list on top, the input line under it,
+/// preview below — nvim's buffer-picker shape — with fzf's decoration stripped
+/// back to a single pointer on the current row.
+///
+/// `reverse-list` is the specific thing that puts the prompt under the list while
+/// keeping rows top-down; plain `default` also moves the prompt down but reads the
+/// list bottom-up, which is wrong wherever the order carries meaning.
+/// `--gutter` is blanked because fzf 0.70 paints a bar down every non-current row.
+///
+/// It lives here rather than in each picker so the pickers cannot drift apart —
+/// and so any future one is in the same visual language for free. These go in
+/// FIRST, so a caller that repeats an option still wins: fzf takes the last.
+const STYLE: [&str; 8] = [
+    "--style=minimal",
+    "--layout=reverse-list",
+    "--info=inline",
+    "--no-scrollbar",
+    "--pointer=›",
+    "--marker= ",
+    "--gutter= ",
+    "--prompt=› ",
+];
+
 /// Pipe `input` into `fzf <args>` and return the selected line, or `None` if the
 /// user aborted (Esc / empty). A writer thread feeds stdin so a large list can't
 /// deadlock against fzf's rendering.
 pub fn pick(args: &[&str], input: String) -> Result<Option<String>> {
     let mut child = Command::new("fzf")
+        .args(STYLE)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

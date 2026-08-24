@@ -112,12 +112,10 @@ fn windows(list: bool) -> Result<()> {
 
     if let Some(sel) = tmux::pick(
         &[
-            "--reverse",
             "--tiebreak=index",
-            "--prompt=window> ",
-            "--header=enter jump · ctrl-x kill · ctrl-j capture",
+            "--header=windows · enter jump · ctrl-x kill · ctrl-j capture",
             &preview,
-            "--preview-window=down:55%",
+            "--preview-window=down,55%,border-top",
             &kill,
             &capture,
         ],
@@ -239,13 +237,19 @@ fn content(history: bool) -> Result<()> {
 
     if let Some(sel) = tmux::pick(
         &[
-            "--reverse",
             "--tiebreak=index",
             "--delimiter=\t",
             "--with-nth=3..",
-            "--prompt=content> ",
+            // The rows come from `capture-pane -ep`, so they carry the panes' own
+            // colour. Without this fzf prints the escapes as literal text and
+            // matches against them too — a query spanning a colour change would
+            // silently fail. With it, rows look like the screen they came from.
+            "--ansi",
+            "--header=content · enter jump",
             preview,
-            "--preview-window=down:55%:+{2}-/2",
+            // The +{2}-/2 offset centres the matched line in the preview; it has
+            // to ride along with the new border-top, not be replaced by it.
+            "--preview-window=down,55%,border-top,+{2}-/2",
         ],
         input,
     )? {
