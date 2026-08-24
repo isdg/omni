@@ -64,7 +64,7 @@ where
 /// It lives here rather than in each picker so the pickers cannot drift apart —
 /// and so any future one is in the same visual language for free. These go in
 /// FIRST, so a caller that repeats an option still wins: fzf takes the last.
-const STYLE: [&str; 8] = [
+const STYLE: [&str; 9] = [
     "--style=minimal",
     "--layout=reverse-list",
     "--info=inline",
@@ -73,6 +73,9 @@ const STYLE: [&str; 8] = [
     "--marker= ",
     "--gutter= ",
     "--prompt=› ",
+    // A rule between the list and the input, so the thing you type into is
+    // visually its own row rather than the last line of the results.
+    "--input-border=line",
 ];
 
 /// Pipe `input` into `fzf <args>` and return the selected line, or `None` if the
