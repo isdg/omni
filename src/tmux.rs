@@ -66,18 +66,21 @@ where
 /// FIRST, so a caller that repeats an option still wins: fzf takes the last.
 const STYLE: [&str; 9] = [
     "--style=minimal",
-    "--layout=reverse-list",
-    // inline-right, not inline: the counter is pinned to the right edge, so it
-    // holds one column instead of sliding rightward as the query grows.
-    "--info=inline-right",
+    // Bottom-up, like nvim's Buffers: the first match sits against the prompt and
+    // the list grows upward, so a short list stays under your cursor instead of
+    // stranding it at the top of an empty pane.
+    "--layout=default",
+    // The counter gets its own line above the prompt, left-aligned and trailed by
+    // a rule: a fixed position no query length can move, and the rule doubles as
+    // the divider the input needs — which is why --input-border is gone, it would
+    // have drawn a second one.
+    "--info=default",
+    "--separator=─",
     "--no-scrollbar",
     "--pointer=›",
     "--marker= ",
     "--gutter= ",
     "--prompt=› ",
-    // A rule between the list and the input, so the thing you type into is
-    // visually its own row rather than the last line of the results.
-    "--input-border=line",
 ];
 
 /// Pipe `input` into `fzf <args>` and return the selected line, or `None` if the
