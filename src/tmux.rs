@@ -59,12 +59,13 @@ where
 /// `reverse-list` is the specific thing that puts the prompt under the list while
 /// keeping rows top-down; plain `default` also moves the prompt down but reads the
 /// list bottom-up, which is wrong wherever the order carries meaning.
-/// `--gutter` is blanked because fzf 0.70 paints a bar down every non-current row.
+/// The gutter is left at fzf's default `▌`, so a rule runs down the left of the
+/// list — the same edge nvim's fzf pickers draw beside their options.
 ///
 /// It lives here rather than in each picker so the pickers cannot drift apart —
 /// and so any future one is in the same visual language for free. These go in
 /// FIRST, so a caller that repeats an option still wins: fzf takes the last.
-const STYLE: [&str; 11] = [
+const STYLE: [&str; 10] = [
     "--style=minimal",
     // Bottom-up, like nvim's Buffers: the first match sits against the prompt and
     // the list grows upward, so a short list stays under your cursor instead of
@@ -79,7 +80,6 @@ const STYLE: [&str; 11] = [
     "--no-scrollbar",
     "--pointer=›",
     "--marker= ",
-    "--gutter= ",
     "--prompt=› ",
     // Key help rides the list's top border as a label. fzf anchors --header to
     // the prompt, which in this bottom-up layout puts it next to the input; the
