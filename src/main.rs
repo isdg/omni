@@ -220,12 +220,62 @@ fn kill_window(target: &str) -> Result<()> {
 /// The recency-ordered window rows fed to the picker (and re-emitted by
 /// `windows --list` after a ctrl-x kill). Field 1 is `session:index`.
 fn window_list() -> Result<String> {
+    // Columns are TAB-separated here and padded below. They used to be joined
+    // with literal double spaces, which cannot be re-split reliably (a pane_title
+    // may contain anything, including two spaces) and so could never be aligned.
     let raw = tmux::query([
         "list-windows", "-a", "-F",
-        "#{window_activity} #{session_last_attached} #{session_name}:#{window_index}  #{window_name}  \
-         #{pane_title}  [#{window_panes}p #{pane_current_command}]  #{pane_current_path}",
+        "#{window_activity} #{session_last_attached} #{session_name}:#{window_index}\t#{window_name}\t\
+         #{pane_title}\t[#{window_panes}p #{pane_current_command}]\t#{pane_current_path}",
     ])?;
-    Ok(strip_sort_keys(&raw, order_mode()))
+    Ok(align_columns(&strip_sort_keys(&raw, order_mode())))
+}
+
+/// Pad TAB-separated columns to a common width and join them with two spaces.
+///
+/// fzf reprints a row verbatim and lays a literal tab on the next 8-column stop,
+/// so alignment has to be baked in rather than left to the terminal. The LAST
+/// column is never padded: it runs free to the edge, and padding it would add
+/// trailing whitespace to every row.
+///
+/// Width is counted in chars, not display cells, so a CJK or emoji pane_title
+/// still nudges its row — the same approximation orchbus makes, and wrong only
+/// for rows that already look unusual.
+fn align_columns(body: &str) -> String {
+    let rows: Vec<Vec<&str>> = body
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split('\t').collect())
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut w = vec![0usize; cols];
+    for r in &rows {
+        for (i, cell) in r.iter().enumerate() {
+            if i + 1 < cols {
+                w[i] = w[i].max(cell.chars().count());
+            }
+        }
+    }
+    rows.iter()
+        .map(|r| {
+            r.iter()
+                .enumerate()
+                .map(|(i, cell)| {
+                    if i + 1 < r.len() {
+                        let pad = w[i].saturating_sub(cell.chars().count());
+                        format!("{cell}{}", " ".repeat(pad))
+                    } else {
+                        cell.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("  ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Each capture line becomes `session:index<TAB>lineno<TAB>content` so fzf can
@@ -505,6 +555,34 @@ mod tests {
         assert_eq!(top_line(398, Some(500)), 1);
         // Empty history: the whole capture is the visible screen.
         assert_eq!(top_line(0, None), 1);
+    }
+
+    #[test]
+    fn align_pads_every_column_but_the_last() {
+        let body = "a\tlong-window\tx\nbbbb\tw\tyy";
+        let out = align_columns(body);
+        // col0 padded to 4 ("bbbb"), col1 to 11 ("long-window"), col2 free.
+        assert_eq!(out, "a     long-window  x\nbbbb  w            yy");
+        // no row ends in whitespace
+        for line in out.lines() {
+            assert_eq!(line, line.trim_end(), "trailing space on: {line:?}");
+        }
+    }
+
+    #[test]
+    fn align_keeps_first_field_a_clean_target_for_fzf() {
+        // fzf's {1} is the first WHITESPACE field; padding must not glue the
+        // pane target to the next column.
+        let out = align_columns("s:1\tzsh\tp\nlonger-session:12\tnvim\tq");
+        let first = out.lines().next().unwrap().split_whitespace().next().unwrap();
+        assert_eq!(first, "s:1");
+    }
+
+    #[test]
+    fn align_survives_a_row_with_fewer_columns() {
+        let out = align_columns("a\tb\tc\nsolo");
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.lines().any(|l| l == "solo"));
     }
 
     #[test]
