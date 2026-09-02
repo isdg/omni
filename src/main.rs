@@ -31,6 +31,12 @@ enum Cmd {
         /// picker's ctrl-x binding to refresh the list after killing a window.
         #[arg(long)]
         list: bool,
+        /// Only windows with an alarm on them, each row led by its state:
+        /// [!] bell, [~] stopped, [*] running, [.] armed but not yet tripped.
+        /// The full list is what the picker shows without this; here the
+        /// question is what you set an alarm on and whether it has gone off.
+        #[arg(long)]
+        alerts: bool,
     },
     /// Show or flip the window picker's order: recency (default) or session.
     /// The choice persists, so ctrl-g's reload comes back in the new order.
@@ -82,7 +88,7 @@ enum Pager {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Windows { list } => windows(list),
+        Cmd::Windows { list, alerts } => windows(list, alerts),
         Cmd::Sort { toggle, header } => {
             let mode = if toggle { toggle_order() } else { order_mode() };
             if header {
@@ -102,8 +108,8 @@ fn main() -> Result<()> {
 /// Rows sorted most-recently-active first: `#{window_activity}` (epoch of last
 /// activity) is prefixed as a numeric sort key, then stripped before fzf.
 /// `--tiebreak=index` keeps that recency order when match scores tie.
-fn windows(list: bool) -> Result<()> {
-    let input = window_list()?;
+fn windows(list: bool, alerts: bool) -> Result<()> {
+    let input = window_list(alerts)?;
 
     // ctrl-x kills the highlighted window, then reloads via `omni windows --list`
     // so the row disappears without leaving the picker. `--list` prints exactly
@@ -120,7 +126,11 @@ fn windows(list: bool) -> Result<()> {
     // {{1}} -> literal {1} for fzf = first whitespace field = session:index.
     // `omni kill` guards the last-window case (would kill the session) with a
     // warning popup instead; the reload then refreshes the (maybe unchanged) list.
-    let kill = format!("--bind=ctrl-x:execute-silent({exe} kill {{1}})+reload({exe} windows --list)");
+    // `mode` rides on every self-invocation below: without it ctrl-x and ctrl-g
+    // would reload the *full* list from inside the alerts view, dropping the
+    // filter and the state column on the first keystroke.
+    let mode = if alerts { " --alerts" } else { "" };
+    let kill = format!("--bind=ctrl-x:execute-silent({exe} kill {{1}})+reload({exe} windows --list{mode})");
     // ctrl-j captures the highlighted window's pane just like prefix j: switch to
     // it, then open its scrollback in nvim. +abort leaves the picker afterward.
     let capture = format!("--bind=ctrl-j:execute-silent({exe} capture --pager nvim --target {{1}})+abort");
@@ -133,9 +143,9 @@ fn windows(list: bool) -> Result<()> {
     // order, and transform-header re-renders the label so it names what you are
     // looking at rather than a fixed action.
     let order = format!(
-        "--bind=ctrl-g:execute-silent({exe} sort --toggle)+reload({exe} windows --list)+transform-list-label({exe} sort --header)"
+        "--bind=ctrl-g:execute-silent({exe} sort --toggle)+reload({exe} windows --list{mode})+transform-list-label({exe} sort --header)"
     );
-    let header = format!("--list-label={}", windows_header());
+    let header = format!("--list-label={}", if alerts { alerts_header() } else { windows_header() });
 
     if let Some(sel) = tmux::pick(
         &[
@@ -149,8 +159,10 @@ fn windows(list: bool) -> Result<()> {
         ],
         input,
     )? {
-        // {1} in fzf = first whitespace field = session:index.
-        if let Some(target) = sel.split_whitespace().next() {
+        // {1} in fzf = first whitespace field, which in alerts mode is the state
+        // marker rather than the target — so take the last field that looks like
+        // one instead of blindly taking the first.
+        if let Some(target) = sel.split_whitespace().find(|f| f.contains(':')) {
             tmux::run(["switch-client", "-t", target])?;
         }
     }
@@ -219,16 +231,71 @@ fn kill_window(target: &str) -> Result<()> {
 
 /// The recency-ordered window rows fed to the picker (and re-emitted by
 /// `windows --list` after a ctrl-x kill). Field 1 is `session:index`.
-fn window_list() -> Result<String> {
+fn window_list(alerts: bool) -> Result<String> {
     // Columns are TAB-separated here and padded below. They used to be joined
     // with literal double spaces, which cannot be re-split reliably (a pane_title
     // may contain anything, including two spaces) and so could never be aligned.
+    //
+    // The alarm fields ride along at the END, past every displayed column, so
+    // strip_sort_keys keeps working on the front of the row and only mark_alerts
+    // has to know they exist. They cost nothing when unused: tmux fills them in
+    // the same call either way.
     let raw = tmux::query([
         "list-windows", "-a", "-F",
         "#{window_activity} #{session_last_attached} #{session_name}:#{window_index}\t#{window_name}\t\
-         #{pane_title}\t[#{window_panes}p #{pane_current_command}]\t#{pane_current_path}",
+         #{pane_title}\t[#{window_panes}p #{pane_current_command}]\t#{pane_current_path}\t\
+         #{window_bell_flag}#{window_silence_flag}#{window_activity_flag}\t\
+         #{monitor-activity}#{?#{monitor-silence},1,0}",
     ])?;
-    Ok(align_columns(&strip_sort_keys(&raw, order_mode())))
+    let body = strip_sort_keys(&raw, order_mode());
+    Ok(align_columns(&if alerts { mark_alerts(&body) } else { drop_alarm_cols(&body) }))
+}
+
+/// The two trailing alarm columns are for mark_alerts, not for the eye.
+fn drop_alarm_cols(body: &str) -> String {
+    body.lines()
+        .map(|l| {
+            let mut cols: Vec<&str> = l.split('\t').collect();
+            cols.truncate(cols.len().saturating_sub(2));
+            cols.join("\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Keep only windows carrying an alarm, and lead each row with its state.
+///
+/// tmux raises the three flags itself — bell on a \a byte, activity on the first
+/// byte of output under monitor-activity, silence once monitor-silence seconds
+/// pass with none — and clears them when the window is selected. So this reads
+/// the aftermath rather than watching anything.
+///
+/// Silence outranks activity because both flags stay raised once set: a window
+/// that has stopped should say so rather than report the burst before it.
+///
+/// A window whose monitors are armed but which has raised nothing is `[.]`,
+/// waiting. That state is not a tmux flag but an inference from the options, and
+/// it is the one the status line cannot show — with no flag raised there is
+/// nothing for its styling to hook onto, so an armed window looks exactly like
+/// an unarmed one there. Which is most of why this mode is worth having.
+fn mark_alerts(body: &str) -> String {
+    body.lines()
+        .filter_map(|l| {
+            let mut cols: Vec<&str> = l.split('\t').collect();
+            let armed = cols.pop()?;
+            let flags = cols.pop()?;
+            let mut f = flags.chars();
+            let state = match (f.next(), f.next(), f.next()) {
+                (Some('1'), _, _) => "[!]",
+                (_, Some('1'), _) => "[~]",
+                (_, _, Some('1')) => "[*]",
+                _ if armed.contains('1') => "[.]",
+                _ => return None,
+            };
+            Some(std::iter::once(state).chain(cols).collect::<Vec<_>>().join("\t"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Pad TAB-separated columns to a common width and join them with two spaces.
@@ -465,6 +532,15 @@ pub fn windows_header() -> String {
     )
 }
 
+/// The alerts view's header. Same keys, different subject — and it names the
+/// markers, since [.] for "armed, nothing yet" is not guessable.
+pub fn alerts_header() -> String {
+    format!(
+        " alerts · {} · [!] bell [~] stopped [*] running [.] waiting · enter jump ",
+        order_label(order_mode())
+    )
+}
+
 fn order_path() -> String {
     let tmp = std::env::var("TMPDIR")
         .ok()
@@ -536,6 +612,36 @@ mod tests {
         let input = b"\x1b]8;;file:///a\x07link\x1b]8;;\x07 \x1b[31mred\x1b[0m \x1b]8;;http://x\x1b\\y\x1b]8;;\x1b\\";
         let out = strip_osc8(input);
         assert_eq!(out, b"link \x1b[31mred\x1b[0m y".to_vec());
+    }
+
+    #[test]
+    fn alerts_keep_only_alarmed_rows_and_lead_with_state() {
+        // flags column is bell/silence/activity; armed is monitor-a/monitor-s.
+        let body = "\
+a:1\tzsh\ttitle\t[1p zsh]\t/p\t100\t00\n\
+a:2\tzsh\ttitle\t[1p zsh]\t/p\t010\t01\n\
+a:3\tzsh\ttitle\t[1p zsh]\t/p\t001\t10\n\
+a:4\tzsh\ttitle\t[1p zsh]\t/p\t000\t01\n\
+a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
+        let out = mark_alerts(body);
+        let states: Vec<&str> = out.lines().map(|l| l.split('\t').next().unwrap()).collect();
+        // a:5 is neither flagged nor armed and is gone; the rest lead with state.
+        assert_eq!(states, ["[!]", "[~]", "[*]", "[.]"]);
+        // The displayed columns survive untouched, alarm columns stripped.
+        assert_eq!(out.lines().next().unwrap(), "[!]\ta:1\tzsh\ttitle\t[1p zsh]\t/p");
+    }
+
+    #[test]
+    fn silence_outranks_activity_when_both_flags_stand() {
+        // Both raised: the window has stopped, which is the newer fact.
+        let body = "a:1\tzsh\tt\t[1p zsh]\t/p\t011\t11";
+        assert!(mark_alerts(body).starts_with("[~]"));
+    }
+
+    #[test]
+    fn plain_mode_drops_the_alarm_columns() {
+        let body = "a:1\tzsh\tt\t[1p zsh]\t/p\t000\t00";
+        assert_eq!(drop_alarm_cols(body), "a:1\tzsh\tt\t[1p zsh]\t/p");
     }
 
     #[test]
