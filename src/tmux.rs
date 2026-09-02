@@ -53,20 +53,24 @@ where
 }
 
 /// The chrome every omni picker wears: list on top, the input line under it,
-/// preview below — nvim's buffer-picker shape — with fzf's decoration stripped
-/// back to a single pointer on the current row.
+/// preview below — nvim's buffer-picker shape.
 ///
 /// `reverse-list` is the specific thing that puts the prompt under the list while
 /// keeping rows top-down; plain `default` also moves the prompt down but reads the
 /// list bottom-up, which is wrong wherever the order carries meaning.
-/// The gutter is left at fzf's default `▌`, so a rule runs down the left of the
-/// list — the same edge nvim's fzf pickers draw beside their options.
+///
+/// No `--style` preset: fzf's built-in default is exactly what nvim's fzf pickers
+/// run with, and it is what colours the `▌` gutter and pointer — the gutter colour
+/// falls back to `bg+`, so the rule down the left of the list follows whatever the
+/// shared fzf theme (`fzf/opts-active.conf`) sets for the current mode. `minimal`
+/// resets that fallback to the terminal's default foreground, which paints the
+/// same bar in plain white; the individual options below strip the preset's
+/// scrollbar and markers instead, which does not touch the colours.
 ///
 /// It lives here rather than in each picker so the pickers cannot drift apart —
 /// and so any future one is in the same visual language for free. These go in
 /// FIRST, so a caller that repeats an option still wins: fzf takes the last.
-const STYLE: [&str; 10] = [
-    "--style=minimal",
+const STYLE: [&str; 8] = [
     // Bottom-up, like nvim's Buffers: the first match sits against the prompt and
     // the list grows upward, so a short list stays under your cursor instead of
     // stranding it at the top of an empty pane.
@@ -78,7 +82,6 @@ const STYLE: [&str; 10] = [
     "--info=default",
     "--separator=─",
     "--no-scrollbar",
-    "--pointer=›",
     "--marker= ",
     "--prompt=› ",
     // Key help rides the list's top border as a label. fzf anchors --header to
