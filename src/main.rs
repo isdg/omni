@@ -123,21 +123,25 @@ fn windows(list: bool, alerts: bool) -> Result<()> {
         .context("cannot resolve own path")?
         .to_string_lossy()
         .into_owned();
-    // {{1}} -> literal {1} for fzf = first whitespace field = session:index.
+    // fzf's {N} is the Nth whitespace field of the row. That is the target in
+    // the plain list, but --alerts prepends the state marker, so every binding
+    // below has to reach one field further along — getting this wrong is silent:
+    // `omni peek [*]` just fails and the preview pane stays blank.
+    let tgt = if alerts { "{2}" } else { "{1}" };
     // `omni kill` guards the last-window case (would kill the session) with a
     // warning popup instead; the reload then refreshes the (maybe unchanged) list.
     // `mode` rides on every self-invocation below: without it ctrl-x and ctrl-g
     // would reload the *full* list from inside the alerts view, dropping the
     // filter and the state column on the first keystroke.
     let mode = if alerts { " --alerts" } else { "" };
-    let kill = format!("--bind=ctrl-x:execute-silent({exe} kill {{1}})+reload({exe} windows --list{mode})");
+    let kill = format!("--bind=ctrl-x:execute-silent({exe} kill {tgt})+reload({exe} windows --list{mode})");
     // ctrl-j captures the highlighted window's pane just like prefix j: switch to
     // it, then open its scrollback in nvim. +abort leaves the picker afterward.
-    let capture = format!("--bind=ctrl-j:execute-silent({exe} capture --pager nvim --target {{1}})+abort");
+    let capture = format!("--bind=ctrl-j:execute-silent({exe} capture --pager nvim --target {tgt})+abort");
     // `omni peek` renders the pane: shells bottom-aligned (recent output), but
     // alternate-screen TUIs (k9s/htop/less/nvim) top-down, since they paint from
     // the top and leave the bottom blank — a plain `tail` would show emptiness.
-    let preview = format!("--preview={exe} peek {{1}}");
+    let preview = format!("--preview={exe} peek {tgt}");
     // ctrl-g flips recency <-> session order. The mode is persisted, so the
     // reload it triggers (a fresh `omni windows --list`) comes back in the new
     // order, and transform-header re-renders the label so it names what you are
