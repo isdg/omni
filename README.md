@@ -44,11 +44,22 @@ run-shell 'OMNI="$(command -v omni || echo "$HOME/.cargo/bin/omni")"; \
 | Key | Does |
 |---|---|
 | `prefix b` | fuzzy-jump to any window across all sessions, most-recently-active first; `ctrl-g` toggles to session order (fzf popup, live preview) |
-| `prefix a` | fuzzy-search the on-screen *content* of every window, jump to the match |
+| `prefix a` | fuzzy-search the on-screen *content* of every window, jump to the matched **line** |
 | `prefix A` | same as `a`, but searches each window's scrollback too |
 | `prefix P` | capture current pane's scrollback into a new window, open in `less` |
 | `prefix j` | capture current pane's scrollback into a new window, open in `nvim` (colors preserved via [baleia.nvim](https://github.com/m00qek/baleia.nvim), if installed) |
 | `prefix J` | same as `j`, but strips colors — plain text in `nvim` |
+
+### Content search lands on the line
+
+Enter does not just switch to the window — it puts that window's pane in
+copy-mode with the cursor on the line you picked and the line selected, the same
+reverse-video row the preview showed. `Escape` clears the selection and leaves
+the cursor free, `y` copies the line, `q` leaves copy-mode.
+
+A `prefix A` hit deep in the scrollback is centred, with the lines either side
+for context. A `prefix a` hit is already on screen, so the view does not move at
+all: the line stays exactly where you saw it in the picker.
 
 ### Window order
 

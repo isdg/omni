@@ -355,6 +355,10 @@ fn align_columns(body: &str) -> String {
 ///
 /// `history` extends the capture back through scrollback (`-S -`); the preview
 /// uses the same range so its line numbers stay aligned with {2}.
+///
+/// Enter switches to the window AND lands on the line — see jump_to_line. The
+/// lineno rode along for the preview only and used to be dropped on selection,
+/// which left you in the right window hunting for the row you had just picked.
 fn content(history: bool) -> Result<()> {
     let ws = tmux::query([
         "list-windows", "-a", "-F",
@@ -403,11 +407,81 @@ fn content(history: bool) -> Result<()> {
         ],
         input,
     )? {
-        if let Some(target) = sel.split('\t').next() {
+        let mut fields = sel.split('\t');
+        if let Some(target) = fields.next() {
             tmux::run(["switch-client", "-t", target])?;
+            if let Some(n) = fields.next().and_then(|s| s.trim().parse::<i64>().ok()) {
+                jump_to_line(target, n, history)?;
+            }
         }
     }
     Ok(())
+}
+
+/// Put the picked line under the cursor: copy-mode on the window's active pane,
+/// scrolled so the line is on screen, cursor on it, the line selected.
+///
+/// copy-mode is the only way tmux can point at a line — a live pane has no
+/// cursor to spare — and it is what the pane is for afterwards anyway: read the
+/// line in place, or `y` it. Escape clears the selection and leaves you free to
+/// move; `q` drops out. `select-line` is there because a bare block cursor mid
+/// row is nearly invisible; it reproduces the reverse-video row the preview
+/// showed, so the hit looks the same before and after Enter.
+///
+/// The pane target is the same `session:index` the row was captured from, so
+/// tmux resolves it to that window's active pane, exactly as `capture` does.
+fn jump_to_line(target: &str, n: i64, history: bool) -> Result<()> {
+    let disp = tmux::query([
+        "display-message", "-p", "-t", target,
+        "#{history_size} #{pane_height}",
+    ])?;
+    let mut it = disp.split_whitespace();
+    let hist: i64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let height: i64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let (oy, row) = copy_position(hist, height, n, history);
+
+    tmux::run(["copy-mode", "-t", target])?;
+    // goto-line takes the scroll offset in lines-from-the-bottom, not a line
+    // number, and it does NOT clamp a negative — window_copy_goto_line sends
+    // anything < 0 to the top of the history instead, which is the wrong end of
+    // the buffer. copy_position clamps, so nothing negative gets here.
+    tmux::run(["send-keys", "-t", target, "-X", "goto-line", &oy.to_string()])?;
+    // Scrolling moves the view, not the cursor, so place the cursor separately:
+    // top-line pins it to the first visible row, then walk down to the hit. One
+    // scroll plus at most a screenful of steps — reaching the line by cursor-up
+    // alone would mean tens of thousands of steps through a deep scrollback.
+    tmux::run(["send-keys", "-t", target, "-X", "top-line"])?;
+    if row > 0 {
+        tmux::run(["send-keys", "-t", target, "-X", "-N", &row.to_string(), "cursor-down"])?;
+    }
+    tmux::run(["send-keys", "-t", target, "-X", "select-line"])
+}
+
+/// Where copy-mode has to sit for capture line `n` to be under the cursor:
+/// `(scroll offset from the bottom, screen row from the top)`.
+///
+/// `capture-pane -S -` lays out `hist` scrollback lines and then the `height`
+/// visible ones, so with the view scrolled `oy` lines off the bottom the top row
+/// shows line `hist + 1 - oy` — invert that and the row of a line is
+/// `line - hist - 1 + oy`.
+///
+/// Both clamps are load-bearing rather than defensive tidiness: `oy` past the
+/// ends of the buffer is what goto-line mishandles, and a `row` from a capture
+/// that no longer matches the pane (it scrolled, or cleared, between the capture
+/// and Enter) would otherwise become a `send-keys -N <huge>` cursor walk.
+fn copy_position(hist: i64, height: i64, n: i64, history: bool) -> (i64, i64) {
+    // Without --history the rows came from the viewport alone, where line n is
+    // screen row n - 1; with it they came from the whole buffer. Convert the
+    // first into the second so one formula covers both.
+    let line = if history { n } else { hist + n };
+    // A history hit needs the view moved, and centring it shows the lines either
+    // side. A viewport hit is already on screen: centring would scroll the very
+    // screen the picker just showed you, so leave it (the clamp below turns this
+    // 0 into oy = 0) and the line stays exactly where you saw it.
+    let centre = if history { height / 2 } else { 0 };
+    let oy = (hist + 1 - line + centre).clamp(0, hist.max(0));
+    let row = (line - hist - 1 + oy).clamp(0, (height - 1).max(0));
+    (oy, row)
 }
 
 /// Capture scrollback, strip OSC-8 hyperlinks, re-apply the pane's exported env,
@@ -665,6 +739,44 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
         assert_eq!(top_line(398, Some(500)), 1);
         // Empty history: the whole capture is the visible screen.
         assert_eq!(top_line(0, None), 1);
+    }
+
+    // The numbers below were read off a real pane (tmux 3.6a, hist 278,
+    // height 24, `seq 1 300` in the scrollback): position copy-mode this way and
+    // #{copy_cursor_line} is the content of capture line n, for every n.
+    #[test]
+    fn a_history_hit_is_centred_and_the_row_follows_the_scroll() {
+        assert_eq!(copy_position(278, 24, 151, true), (140, 12));
+        assert_eq!(copy_position(278, 24, 100, true), (191, 12));
+    }
+
+    #[test]
+    fn a_viewport_hit_stays_where_the_picker_showed_it() {
+        // No --history: the view must not move, so the row is the screen row.
+        assert_eq!(copy_position(278, 24, 1, false), (0, 0));
+        assert_eq!(copy_position(278, 24, 5, false), (0, 4));
+        assert_eq!(copy_position(278, 24, 24, false), (0, 23));
+    }
+
+    #[test]
+    fn both_ends_clamp_the_scroll_and_spend_the_rest_on_the_row() {
+        // Top of the history: there is nothing left to scroll, so the row
+        // absorbs what centring asked for.
+        assert_eq!(copy_position(278, 24, 2, true), (278, 1));
+        assert_eq!(copy_position(278, 24, 13, true), (278, 12));
+        // Last screenful: same at the other end — oy bottoms out at 0 and the
+        // cursor walks down instead.
+        assert_eq!(copy_position(278, 24, 295, true), (0, 16));
+        assert_eq!(copy_position(278, 24, 302, true), (0, 23));
+    }
+
+    #[test]
+    fn a_line_past_the_capture_cannot_become_a_giant_cursor_walk() {
+        // Stale capture (the pane scrolled or cleared before Enter): land on the
+        // last row rather than sending `-N 9998` cursor-down.
+        assert_eq!(copy_position(0, 24, 9_999, true), (0, 23));
+        // And an empty pane has no row to land on, but must not go negative.
+        assert_eq!(copy_position(0, 0, 1, true), (0, 0));
     }
 
     #[test]
