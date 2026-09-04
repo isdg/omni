@@ -1,8 +1,8 @@
 //! omni — fzf-backed tmux navigation + scrollback capture.
 //!
 //!   omni windows   fuzzy-jump to any window across all sessions   (prefix b)
-//!   omni content   fuzzy-search on-screen text of every window     (prefix a)
-//!                  add --history to also search scrollback         (prefix A)
+//!   omni content   fuzzy-search this session: screen + scrollback  (prefix a)
+//!                  --all: every session, not just this one         (prefix A)
 //!   omni capture   capture this pane's scrollback into a new window (prefix j/J/P)
 //!
 //! The `.tmux` bindings are one-liners that call these; the per-prompt env
@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use regex::bytes::Regex;
 use std::io::Write;
+use std::sync::OnceLock;
 
 #[derive(Parser)]
 #[command(name = "omni", about = "fzf-backed tmux navigation + capture")]
@@ -48,11 +49,16 @@ enum Cmd {
         #[arg(long)]
         header: bool,
     },
-    /// Fuzzy-search the visible content of every window, then switch.
+    /// Fuzzy-search this session's windows — screen and scrollback — then switch.
     Content {
-        /// Also search each window's scrollback history, not just the viewport.
-        #[arg(long)]
-        history: bool,
+        /// Search every session's windows, not just the one you are in.
+        ///
+        /// `history` is kept as an alias because that is the flag baked into the
+        /// `prefix A` binding of any tmux server started before the rename; a
+        /// running server holds its bindings in memory, so dropping the old name
+        /// would break that key until the config was reloaded.
+        #[arg(long, alias = "history")]
+        all: bool,
     },
     /// Render a pane for the picker preview (bottom-aligned shell / top TUI).
     Peek {
@@ -98,7 +104,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Content { history } => content(history),
+        Cmd::Content { all } => content(all),
         Cmd::Peek { target } => peek(&target),
         Cmd::Kill { target } => kill_window(&target),
         Cmd::Capture { pager, target } => capture(pager, target),
@@ -353,41 +359,76 @@ fn align_columns(body: &str) -> String {
 /// match on content (`--with-nth=3..` hides the target + lineno) while still
 /// recovering the target from field 1. Preview centers the matched line ({2}).
 ///
-/// `history` extends the capture back through scrollback (`-S -`); the preview
+/// Every window is captured to the start of its scrollback (`-S -`); the preview
 /// uses the same range so its line numbers stay aligned with {2}.
 ///
 /// Enter switches to the window AND lands on the line — see jump_to_line. The
 /// lineno rode along for the preview only and used to be dropped on selection,
 /// which left you in the right window hunting for the row you had just picked.
-fn content(history: bool) -> Result<()> {
-    let ws = tmux::query([
-        "list-windows", "-a", "-F",
-        "#{window_activity} #{session_last_attached} #{session_name}:#{window_index}",
-    ])?;
-    // Content search always reads recency-first: it is "what did I just see?".
-    let ordered = strip_sort_keys(&ws, Order::Recency);
+///
+/// **Scope is the only difference between the two keys.** `prefix a` searches
+/// this session, `prefix A` (`--all`) every session, and both read the full
+/// scrollback.
+///
+/// `a` used to search the viewport alone, which was fine while it also spanned
+/// the server — but once it narrowed to one session the two limits multiplied and
+/// it stopped being able to find anything: four windows' visible screens came to
+/// 97 rows, against 105k for `A`. A session is a workspace (one repo, one
+/// worktree, one machine), so the useful question there is not "what is on screen
+/// in this session" but "what have I seen in this session" — the same question
+/// `A` asks, over the part of the server you are actually working in. Hence one
+/// capture range and one knob.
+fn content(all: bool) -> Result<()> {
+    // One call answers both questions: which session to search, and which window
+    // to put first. Session names cannot contain ':' (tmux rejects it), so the
+    // split is unambiguous.
+    let cur = current_window();
+    let sess = cur.split_once(':').map(|(s, _)| s).unwrap_or_default();
 
-    // With history, start capture at the beginning of scrollback (-S -); the
-    // preview command below must match so {2} lands on the right line.
-    let cap: &[&str] = if history {
-        &["capture-pane", "-ep", "-S", "-", "-t"]
+    const FMT: &str = "#{window_activity} #{session_last_attached} #{session_name}:#{window_index}";
+    // For the session scope, `-t` is not decoration: a bare `list-windows`
+    // resolves "current session" through `$TMUX_PANE`, which a popup inherits
+    // from the client's environment and which can point into a *different*
+    // session — that silently searches the wrong session's windows.
+    // `#{client_session}` is resolved from the client rather than a pane target,
+    // so it always names the session you are actually looking at.
+    let ws = if all {
+        tmux::query(["list-windows", "-a", "-F", FMT])?
+    } else if sess.is_empty() {
+        anyhow::bail!("cannot tell which session this client is on")
     } else {
-        &["capture-pane", "-ep", "-t"]
+        tmux::query(["list-windows", "-t", sess, "-F", FMT])?
     };
-    let preview = if history {
-        "--preview=tmux capture-pane -ep -S - -t {1} | awk -v n={2} 'NR==n{print \"\\033[7m\" $0 \"\\033[0m\"; next}{print}'"
-    } else {
-        "--preview=tmux capture-pane -ep -t {1} | awk -v n={2} 'NR==n{print \"\\033[7m\" $0 \"\\033[0m\"; next}{print}'"
-    };
+    // Content search always reads recency-first: it is "what did I just see?".
+    // And the most recent thing you saw is the window you are on, which
+    // `#{window_activity}` alone does not say — hence current_first. The second
+    // sort key still earns its keep for `--all`, which spans sessions; within one
+    // session it is constant, so activity ties there fall back to tmux's window
+    // order, which is what you would guess anyway.
+    let ordered = current_first(&strip_sort_keys(&ws, Order::Recency), &cur);
+
+    // Capture from the start of scrollback; the preview must use the same range
+    // or {2} lands on the wrong line.
+    let cap = ["capture-pane", "-ep", "-S", "-", "-t"];
+    let preview = "--preview=tmux capture-pane -ep -S - -t {1} | awk -v n={2} 'NR==n{print \"\\033[7m\" $0 \"\\033[0m\"; next}{print}'";
 
     let mut input = String::new();
     for t in ordered.lines() {
         let args: Vec<&str> = cap.iter().copied().chain([t]).collect();
         let pane = tmux::query(args).unwrap_or_default();
-        for (i, line) in pane.lines().enumerate() {
-            input.push_str(&format!("{t}\t{}\t{line}\n", i + 1));
-        }
+        input.push_str(&content_rows(t, &pane));
     }
+
+    // Name the session on the border when that is the scope: a narrowed picker
+    // is otherwise indistinguishable from a wide one, and "why is my other
+    // window not in here?" is the first question it raises. `--all` spans every
+    // session, so there is no one session to name and its label is the plain one
+    // `prefix A` has always had.
+    let label = if all {
+        "--list-label= content · enter jump ".to_string()
+    } else {
+        format!("--list-label= content · {sess} · enter jump ")
+    };
 
     if let Some(sel) = tmux::pick(
         &[
@@ -399,7 +440,7 @@ fn content(history: bool) -> Result<()> {
             // matches against them too — a query spanning a colour change would
             // silently fail. With it, rows look like the screen they came from.
             "--ansi",
-            "--list-label= content · enter jump ",
+            &label,
             preview,
             // The +{2}-/2 offset centres the matched line in the preview; it has
             // to ride along with the new border-top, not be replaced by it.
@@ -411,26 +452,117 @@ fn content(history: bool) -> Result<()> {
         if let Some(target) = fields.next() {
             tmux::run(["switch-client", "-t", target])?;
             if let Some(n) = fields.next().and_then(|s| s.trim().parse::<i64>().ok()) {
-                jump_to_line(target, n, history)?;
+                jump_to_line(target, n)?;
             }
         }
     }
     Ok(())
 }
 
+/// One window's picker rows — `target<TAB>lineno<TAB>content` per captured line,
+/// with the blank ones dropped.
+///
+/// A capture ends with the viewport, which is always `pane_height` lines, so
+/// every window contributes its unused tail; a prompt that pads itself with a
+/// blank line adds more throughout. On a real 32-window server that is 11,085 of
+/// 116,670 rows — and it was 587 of 1531 back when only the viewport was read,
+/// which is where this was first noticed. They cannot be matched (there is
+/// nothing for fzf to score) and there is no reason to put the cursor on one, so
+/// all they did was inflate the count and space the rows you actually read apart
+/// by a screenful of nothing.
+///
+/// The lineno stays the line's position in the *capture*, not its position in
+/// this list. The preview centres on it (`awk NR==n`) and jump_to_line converts
+/// it into a copy-mode row, so renumbering after a dropped blank would put both
+/// on the wrong line — which is why the filter comes after `enumerate` and never
+/// before it. The preview keeps its blanks for the same reason: it is a picture
+/// of the pane, and a pane has blank lines on it.
+fn content_rows(target: &str, pane: &str) -> String {
+    let mut out = String::new();
+    for (i, line) in pane.lines().enumerate() {
+        if is_blank(line) {
+            continue;
+        }
+        out.push_str(&format!("{target}\t{}\t{line}\n", i + 1));
+    }
+    out
+}
+
+/// A captured line with nothing visible on it.
+///
+/// The cheap test first, since in practice nearly every blank row arrives as a
+/// plain empty string. The regex is for the other case: `capture-pane -e` writes
+/// out the pane's colour state as it changes, so a blank row can come through as
+/// a couple of SGR sequences and no text — blank on screen, but not `""`.
+fn is_blank(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return true;
+    }
+    static ESC: OnceLock<regex::Regex> = OnceLock::new();
+    let re = ESC.get_or_init(|| {
+        regex::Regex::new(r"\x1b\[[0-9;:?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b.")
+            .expect("static regex")
+    });
+    re.replace_all(line, "").trim().is_empty()
+}
+
+/// The `session:index` the client is looking at — the window the picker's popup
+/// is drawn over. Read as one format so it is the client's *current* window and
+/// not whatever pane a stale `$TMUX_PANE` in the popup's environment points at;
+/// tmux resolves the client first, which is what makes this safe.
+///
+/// Empty when tmux cannot say, which current_first reads as "no current window".
+fn current_window() -> String {
+    tmux::query(["display-message", "-p", "#{client_session}:#{window_index}"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Hoist the current window to the front of the content order.
+///
+/// `#{window_activity}` is an *output* timestamp, not an attention one: a pane
+/// running Claude Code or k9s restamps it every second, while the window you are
+/// actually sitting in — nvim, a shell at a prompt — holds a constant one. So
+/// recency ranks the chatty windows above the one in front of you: on a real
+/// 32-window server the current window came sixth, behind five `claude`/`k9s`
+/// windows. And because `--tiebreak=index` settles a score tie in favour of the
+/// earlier row, a query matching text that also exists in one of those windows
+/// jumped there instead — the content you were looking at losing to an identical
+/// line somewhere else.
+///
+/// Searching what you can see has to land where you are, so the current window
+/// goes first and everything else keeps its recency order.
+///
+/// A `cur` that is not in the list is dropped rather than prepended: tmux may
+/// have said nothing, or the window may have gone between the two calls, and an
+/// invented target would just be a row whose capture is empty.
+fn current_first(ordered: &str, cur: &str) -> String {
+    let mut rows: Vec<&str> = ordered.lines().collect();
+    if let Some(i) = rows.iter().position(|l| *l == cur) {
+        let row = rows.remove(i);
+        rows.insert(0, row);
+    }
+    rows.join("\n")
+}
+
 /// Put the picked line under the cursor: copy-mode on the window's active pane,
-/// scrolled so the line is on screen, cursor on it, the line selected.
+/// scrolled so the line is on screen and the cursor on it.
 ///
 /// copy-mode is the only way tmux can point at a line — a live pane has no
 /// cursor to spare — and it is what the pane is for afterwards anyway: read the
-/// line in place, or `y` it. Escape clears the selection and leaves you free to
-/// move; `q` drops out. `select-line` is there because a bare block cursor mid
-/// row is nearly invisible; it reproduces the reverse-video row the preview
-/// showed, so the hit looks the same before and after Enter.
+/// line in place, `v`+motion then `y` to copy part of it, `q` to drop out.
+///
+/// The cursor is moved and nothing else. This used to end with `select-line`, to
+/// reproduce the reverse-video row the preview showed, and that was the wrong
+/// trade: it hands you copy-mode with a live line-wise selection, so the first
+/// motion you make drags the selection with it instead of just moving, and
+/// getting back to a clean cursor means finding `clear-selection` (Escape, in
+/// the default vi table) rather than simply moving. A selection is something you
+/// start on purpose; landing on a line is not that.
 ///
 /// The pane target is the same `session:index` the row was captured from, so
 /// tmux resolves it to that window's active pane, exactly as `capture` does.
-fn jump_to_line(target: &str, n: i64, history: bool) -> Result<()> {
+fn jump_to_line(target: &str, n: i64) -> Result<()> {
     let disp = tmux::query([
         "display-message", "-p", "-t", target,
         "#{history_size} #{pane_height}",
@@ -438,7 +570,7 @@ fn jump_to_line(target: &str, n: i64, history: bool) -> Result<()> {
     let mut it = disp.split_whitespace();
     let hist: i64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let height: i64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let (oy, row) = copy_position(hist, height, n, history);
+    let (oy, row) = copy_position(hist, height, n);
 
     tmux::run(["copy-mode", "-t", target])?;
     // goto-line takes the scroll offset in lines-from-the-bottom, not a line
@@ -454,7 +586,7 @@ fn jump_to_line(target: &str, n: i64, history: bool) -> Result<()> {
     if row > 0 {
         tmux::run(["send-keys", "-t", target, "-X", "-N", &row.to_string(), "cursor-down"])?;
     }
-    tmux::run(["send-keys", "-t", target, "-X", "select-line"])
+    Ok(())
 }
 
 /// Where copy-mode has to sit for capture line `n` to be under the cursor:
@@ -469,16 +601,19 @@ fn jump_to_line(target: &str, n: i64, history: bool) -> Result<()> {
 /// ends of the buffer is what goto-line mishandles, and a `row` from a capture
 /// that no longer matches the pane (it scrolled, or cleared, between the capture
 /// and Enter) would otherwise become a `send-keys -N <huge>` cursor walk.
-fn copy_position(hist: i64, height: i64, n: i64, history: bool) -> (i64, i64) {
-    // Without --history the rows came from the viewport alone, where line n is
-    // screen row n - 1; with it they came from the whole buffer. Convert the
-    // first into the second so one formula covers both.
-    let line = if history { n } else { hist + n };
-    // A history hit needs the view moved, and centring it shows the lines either
-    // side. A viewport hit is already on screen: centring would scroll the very
-    // screen the picker just showed you, so leave it (the clamp below turns this
-    // 0 into oy = 0) and the line stays exactly where you saw it.
-    let centre = if history { height / 2 } else { 0 };
+/// Every row now comes from a `-S -` capture, so `n` is a position in the whole
+/// buffer and there is no viewport-relative case to convert — the second half of
+/// this function used to exist only for the viewport-only `prefix a`, which no
+/// longer has a caller.
+///
+/// The hit is centred, so the lines either side of it come with it. A hit that
+/// was already on screen gets moved too, which is the one thing lost with the
+/// viewport mode: it used to leave the view alone so the line stayed exactly
+/// where the picker showed it. The clamp still pins the last screenful, so the
+/// bottom of the buffer does not scroll into empty space.
+fn copy_position(hist: i64, height: i64, n: i64) -> (i64, i64) {
+    let line = n;
+    let centre = height / 2;
     let oy = (hist + 1 - line + centre).clamp(0, hist.max(0));
     let row = (line - hist - 1 + oy).clamp(0, (height - 1).max(0));
     (oy, row)
@@ -745,38 +880,31 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
     // height 24, `seq 1 300` in the scrollback): position copy-mode this way and
     // #{copy_cursor_line} is the content of capture line n, for every n.
     #[test]
-    fn a_history_hit_is_centred_and_the_row_follows_the_scroll() {
-        assert_eq!(copy_position(278, 24, 151, true), (140, 12));
-        assert_eq!(copy_position(278, 24, 100, true), (191, 12));
-    }
-
-    #[test]
-    fn a_viewport_hit_stays_where_the_picker_showed_it() {
-        // No --history: the view must not move, so the row is the screen row.
-        assert_eq!(copy_position(278, 24, 1, false), (0, 0));
-        assert_eq!(copy_position(278, 24, 5, false), (0, 4));
-        assert_eq!(copy_position(278, 24, 24, false), (0, 23));
+    fn a_hit_is_centred_and_the_row_follows_the_scroll() {
+        assert_eq!(copy_position(278, 24, 151), (140, 12));
+        assert_eq!(copy_position(278, 24, 100), (191, 12));
     }
 
     #[test]
     fn both_ends_clamp_the_scroll_and_spend_the_rest_on_the_row() {
         // Top of the history: there is nothing left to scroll, so the row
         // absorbs what centring asked for.
-        assert_eq!(copy_position(278, 24, 2, true), (278, 1));
-        assert_eq!(copy_position(278, 24, 13, true), (278, 12));
+        assert_eq!(copy_position(278, 24, 2), (278, 1));
+        assert_eq!(copy_position(278, 24, 13), (278, 12));
         // Last screenful: same at the other end — oy bottoms out at 0 and the
-        // cursor walks down instead.
-        assert_eq!(copy_position(278, 24, 295, true), (0, 16));
-        assert_eq!(copy_position(278, 24, 302, true), (0, 23));
+        // cursor walks down instead. These are the rows a viewport hit lands on
+        // now that there is no viewport-only mode to leave the view alone.
+        assert_eq!(copy_position(278, 24, 295), (0, 16));
+        assert_eq!(copy_position(278, 24, 302), (0, 23));
     }
 
     #[test]
     fn a_line_past_the_capture_cannot_become_a_giant_cursor_walk() {
         // Stale capture (the pane scrolled or cleared before Enter): land on the
         // last row rather than sending `-N 9998` cursor-down.
-        assert_eq!(copy_position(0, 24, 9_999, true), (0, 23));
+        assert_eq!(copy_position(0, 24, 9_999), (0, 23));
         // And an empty pane has no row to land on, but must not go negative.
-        assert_eq!(copy_position(0, 0, 1, true), (0, 0));
+        assert_eq!(copy_position(0, 0, 1), (0, 0));
     }
 
     #[test]
@@ -805,6 +933,81 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
         let out = align_columns("a\tb\tc\nsolo");
         assert_eq!(out.lines().count(), 2);
         assert!(out.lines().any(|l| l == "solo"));
+    }
+
+    #[test]
+    fn blank_rows_go_but_the_line_numbers_stay() {
+        // The invariant that matters: the lineno is the line's place in the
+        // capture, so the preview's `awk NR==n` and jump_to_line's copy-mode row
+        // still point at it. Dropping line 2 must not renumber line 4 to 3.
+        let pane = "alpha\n\n   \nbravo\n\ncharlie";
+        assert_eq!(
+            content_rows("s:1", pane),
+            "s:1\t1\talpha\ns:1\t4\tbravo\ns:1\t6\tcharlie\n"
+        );
+    }
+
+    #[test]
+    fn a_row_of_nothing_but_escapes_is_blank_too() {
+        // capture-pane -e re-emits the pane's colour state, so a blank row can
+        // arrive as SGR sequences and no text. Coloured *text* obviously stays.
+        assert!(is_blank("\x1b[39m\x1b[49m"));
+        assert!(is_blank("\x1b[0m   \x1b[K"));
+        assert!(!is_blank("\x1b[31mred\x1b[0m"));
+        let pane = "\x1b[39m\x1b[49m\n\x1b[31mred\x1b[0m";
+        assert_eq!(content_rows("s:1", pane), "s:1\t2\t\x1b[31mred\x1b[0m\n");
+    }
+
+    #[test]
+    fn an_all_blank_pane_contributes_no_rows() {
+        // An untouched window is not worth a single row, let alone a screenful.
+        assert_eq!(content_rows("s:1", "\n\n\n"), "");
+        assert_eq!(content_rows("s:1", ""), "");
+    }
+
+    #[test]
+    fn the_window_you_are_on_leads_the_content_order() {
+        // The real shape of the bug: every window ahead of the current one is a
+        // Claude/k9s pane restamping its activity every second, so "recency"
+        // buried the window in front of you and an identical line in one of them
+        // won the tiebreak.
+        let ordered = "rc:2\ncosmos-main:2\nmisc:2\nagents:1\nagents:2\nbtw:1";
+        assert_eq!(
+            current_first(ordered, "agents:2"),
+            "agents:2\nrc:2\ncosmos-main:2\nmisc:2\nagents:1\nbtw:1"
+        );
+    }
+
+    #[test]
+    fn an_unknown_current_window_is_never_invented() {
+        // tmux said nothing, or the window went between the two calls: leave the
+        // order alone rather than adding a target that captures nothing.
+        let ordered = "rc:2\nbtw:1";
+        assert_eq!(current_first(ordered, ""), ordered);
+        assert_eq!(current_first(ordered, "gone:9"), ordered);
+        assert_eq!(current_first("", "rc:2"), "");
+    }
+
+    #[test]
+    fn a_current_window_already_first_stays_put() {
+        // Idempotent, so the hoist cannot reorder what recency already got right.
+        let ordered = "rc:2\nbtw:1";
+        assert_eq!(current_first(ordered, "rc:2"), ordered);
+    }
+
+    #[test]
+    fn hoisting_matches_on_the_whole_target_not_a_prefix() {
+        // `agents:1` must not be mistaken for `agents:12`, and a session whose
+        // name is a prefix of another must not be either.
+        let ordered = "agents:12\nagents:1\ncosmos:1\ncosmos-main:1";
+        assert_eq!(
+            current_first(ordered, "agents:1"),
+            "agents:1\nagents:12\ncosmos:1\ncosmos-main:1"
+        );
+        assert_eq!(
+            current_first(ordered, "cosmos:1"),
+            "cosmos:1\nagents:12\nagents:1\ncosmos-main:1"
+        );
     }
 
     #[test]
