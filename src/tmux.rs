@@ -70,7 +70,11 @@ where
 /// It lives here rather than in each picker so the pickers cannot drift apart —
 /// and so any future one is in the same visual language for free. These go in
 /// FIRST, so a caller that repeats an option still wins: fzf takes the last.
-const STYLE: [&str; 8] = [
+const STYLE: [&str; 9] = [
+    // M-j labels every visible row and the `jump` event takes the landing as the
+    // selection: fzf's own EasyMotion. Alt keeps space in the query and leaves
+    // ctrl-j on capture. Here, not the shared opts file, so it travels with omni.
+    "--bind=alt-j:jump,jump:accept",
     // Bottom-up, like nvim's Buffers: the first match sits against the prompt and
     // the list grows upward, so a short list stays under your cursor instead of
     // stranding it at the top of an empty pane.
