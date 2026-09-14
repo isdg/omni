@@ -1,6 +1,7 @@
 //! omni — fzf-backed tmux navigation + scrollback capture.
 //!
 //!   omni windows   fuzzy-jump to any window across all sessions   (prefix b)
+//!                  --session: only this session's windows          (prefix w)
 //!   omni content   fuzzy-search this session: screen + scrollback  (prefix a)
 //!                  --all: every session, not just this one         (prefix A)
 //!   omni capture   capture this pane's scrollback into a new window (prefix j/J/P)
@@ -26,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Fuzzy-jump to any window across all sessions.
+    /// Fuzzy-jump to any window across all sessions, or just this one's.
     Windows {
         /// Print the window list to stdout instead of launching fzf. Used by the
         /// picker's ctrl-x binding to refresh the list after killing a window.
@@ -38,6 +39,9 @@ enum Cmd {
         /// question is what you set an alarm on and whether it has gone off.
         #[arg(long)]
         alerts: bool,
+        /// Only this session's windows, rather than every window on the server.
+        #[arg(long)]
+        session: bool,
     },
     /// Show or flip the window picker's order: recency (default) or session.
     /// The choice persists, so ctrl-g's reload comes back in the new order.
@@ -48,6 +52,14 @@ enum Cmd {
         /// Print the picker's full header line instead of just the mode.
         #[arg(long)]
         header: bool,
+        /// Which picker's header to print. These have to be repeated here
+        /// because ctrl-g re-renders the label through a *fresh* `omni sort`
+        /// process: without them the label a narrowed picker came up with is
+        /// replaced by the plain one on the first order toggle.
+        #[arg(long)]
+        alerts: bool,
+        #[arg(long)]
+        session: bool,
     },
     /// Fuzzy-search this session's windows — screen and scrollback — then switch.
     Content {
@@ -94,11 +106,11 @@ enum Pager {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Windows { list, alerts } => windows(list, alerts),
-        Cmd::Sort { toggle, header } => {
+        Cmd::Windows { list, alerts, session } => windows(list, alerts, session),
+        Cmd::Sort { toggle, header, alerts, session } => {
             let mode = if toggle { toggle_order() } else { order_mode() };
             if header {
-                println!("{}", windows_header());
+                println!("{}", picker_header(alerts, scope(session)?.as_deref()));
             } else {
                 println!("{}", order_label(mode));
             }
@@ -114,8 +126,14 @@ fn main() -> Result<()> {
 /// Rows sorted most-recently-active first: `#{window_activity}` (epoch of last
 /// activity) is prefixed as a numeric sort key, then stripped before fzf.
 /// `--tiebreak=index` keeps that recency order when match scores tie.
-fn windows(list: bool, alerts: bool) -> Result<()> {
-    let input = window_list(alerts)?;
+///
+/// `session` narrows the list to the session you are in — prefix w, next to
+/// prefix b's whole-server list. Not a replacement for it: b is how you cross
+/// sessions, and B is for when you already know the window is in this one and
+/// the other 25 rows are just noise to type past.
+fn windows(list: bool, alerts: bool, session: bool) -> Result<()> {
+    let scope = scope(session)?;
+    let input = window_list(alerts, scope.as_deref())?;
 
     // ctrl-x kills the highlighted window, then reloads via `omni windows --list`
     // so the row disappears without leaving the picker. `--list` prints exactly
@@ -137,9 +155,15 @@ fn windows(list: bool, alerts: bool) -> Result<()> {
     // `omni kill` guards the last-window case (would kill the session) with a
     // warning popup instead; the reload then refreshes the (maybe unchanged) list.
     // `mode` rides on every self-invocation below: without it ctrl-x and ctrl-g
-    // would reload the *full* list from inside the alerts view, dropping the
-    // filter and the state column on the first keystroke.
-    let mode = if alerts { " --alerts" } else { "" };
+    // would reload the *full* list from inside a narrowed view, dropping the
+    // filter — and, for alerts, the state column — on the first keystroke. Every
+    // flag that shapes the list has to be repeated here for the same reason,
+    // which is why --session joins --alerts rather than being handled once.
+    let mode = format!(
+        "{}{}",
+        if alerts { " --alerts" } else { "" },
+        if session { " --session" } else { "" },
+    );
     let kill = format!("--bind=ctrl-x:execute-silent({exe} kill {tgt})+reload({exe} windows --list{mode})");
     // ctrl-j captures the highlighted window's pane just like prefix j: switch to
     // it, then open its scrollback in nvim. +abort leaves the picker afterward.
@@ -153,9 +177,9 @@ fn windows(list: bool, alerts: bool) -> Result<()> {
     // order, and transform-header re-renders the label so it names what you are
     // looking at rather than a fixed action.
     let order = format!(
-        "--bind=ctrl-g:execute-silent({exe} sort --toggle)+reload({exe} windows --list{mode})+transform-list-label({exe} sort --header)"
+        "--bind=ctrl-g:execute-silent({exe} sort --toggle)+reload({exe} windows --list{mode})+transform-list-label({exe} sort --header{mode})"
     );
-    let header = format!("--list-label={}", if alerts { alerts_header() } else { windows_header() });
+    let header = format!("--list-label={}", picker_header(alerts, scope.as_deref()));
 
     if let Some(sel) = tmux::pick(
         &[
@@ -239,9 +263,28 @@ fn kill_window(target: &str) -> Result<()> {
     ])
 }
 
+/// The session a picker is narrowed to, or `None` for the whole server.
+///
+/// `-t <session>` rather than a bare `list-windows`: the bare form resolves
+/// "current session" through `$TMUX_PANE`, which a popup inherits from the
+/// client's environment and which can point into a *different* session — it
+/// silently lists the wrong session's windows. `#{client_session}` is resolved
+/// from the client, not a pane target, so it names the session on screen.
+fn scope(session: bool) -> Result<Option<String>> {
+    if !session {
+        return Ok(None);
+    }
+    let cur = current_window();
+    let s = cur.split_once(':').map(|(s, _)| s).unwrap_or_default();
+    if s.is_empty() {
+        anyhow::bail!("cannot tell which session this client is on");
+    }
+    Ok(Some(s.to_string()))
+}
+
 /// The recency-ordered window rows fed to the picker (and re-emitted by
 /// `windows --list` after a ctrl-x kill). Field 1 is `session:index`.
-fn window_list(alerts: bool) -> Result<String> {
+fn window_list(alerts: bool, scope: Option<&str>) -> Result<String> {
     // Columns are TAB-separated here and padded below. They used to be joined
     // with literal double spaces, which cannot be re-split reliably (a pane_title
     // may contain anything, including two spaces) and so could never be aligned.
@@ -250,13 +293,18 @@ fn window_list(alerts: bool) -> Result<String> {
     // strip_sort_keys keeps working on the front of the row and only mark_alerts
     // has to know they exist. They cost nothing when unused: tmux fills them in
     // the same call either way.
-    let raw = tmux::query([
-        "list-windows", "-a", "-F",
-        "#{window_activity} #{session_last_attached} #{session_name}:#{window_index}\t#{window_name}\t\
+    // `@seen` is the visit sequence the select hook stamps on a window; the
+    // arithmetic wrapper turns a never-visited window's empty option into 0, so
+    // every row carries a number the sort can read.
+    const FMT: &str =
+        "#{e|+:#{@seen},0} #{window_activity} #{session_last_attached} #{session_name}:#{window_index}\t#{window_name}\t\
          #{pane_title}\t[#{window_panes}p #{pane_current_command}]\t#{pane_current_path}\t\
          #{window_bell_flag}#{window_silence_flag}#{window_activity_flag}\t\
-         #{monitor-activity}#{?#{monitor-silence},1,0}",
-    ])?;
+         #{monitor-activity}#{?#{monitor-silence},1,0}";
+    let raw = match scope {
+        Some(s) => tmux::query(["list-windows", "-t", s, "-F", FMT])?,
+        None => tmux::query(["list-windows", "-a", "-F", FMT])?,
+    };
     let body = strip_sort_keys(&raw, order_mode());
     Ok(align_columns(&if alerts { mark_alerts(&body) } else { drop_alarm_cols(&body) }))
 }
@@ -385,7 +433,10 @@ fn content(all: bool) -> Result<()> {
     let cur = current_window();
     let sess = cur.split_once(':').map(|(s, _)| s).unwrap_or_default();
 
-    const FMT: &str = "#{window_activity} #{session_last_attached} #{session_name}:#{window_index}";
+    // The visit stamp leads every row so one parser serves both pickers; content
+    // is fixed to activity order and never reads it.
+    const FMT: &str =
+        "#{e|+:#{@seen},0} #{window_activity} #{session_last_attached} #{session_name}:#{window_index}";
     // For the session scope, `-t` is not decoration: a bare `list-windows`
     // resolves "current session" through `$TMUX_PANE`, which a popup inherits
     // from the client's environment and which can point into a *different*
@@ -725,6 +776,10 @@ fn top_line(hist: i64, scroll: Option<i64>) -> i64 {
 pub enum Order {
     /// Most recently active first. The default: it answers "where was I?".
     Recency,
+    /// Last *visited* first, stamped by the select hook. Answers "where was I?"
+    /// truthfully, which recency cannot: `#{window_activity}` times output, so a
+    /// chatty pane outranks the window you were reading a second ago.
+    Visited,
     /// tmux's own order — session name, then window index. Stable and
     /// predictable, which is what you want when you know the name you are after.
     Session,
@@ -733,6 +788,7 @@ pub enum Order {
 pub fn order_label(o: Order) -> &'static str {
     match o {
         Order::Recency => "recency",
+        Order::Visited => "visited",
         Order::Session => "session",
     }
 }
@@ -754,6 +810,24 @@ pub fn alerts_header() -> String {
     )
 }
 
+/// The label a window picker wears, for whichever view it is showing.
+///
+/// The session name leads when the list is narrowed to one, because that is the
+/// only thing distinguishing prefix w's picker from prefix b's — same columns,
+/// same keys, same preview, fewer rows. Without it the two are indistinguishable
+/// on screen and you cannot tell whether a window is missing or merely elsewhere.
+///
+/// One function rather than three call sites choosing between them: ctrl-g
+/// re-renders this through a fresh process, so every view has to be reachable
+/// from flags alone.
+pub fn picker_header(alerts: bool, scope: Option<&str>) -> String {
+    let base = if alerts { alerts_header() } else { windows_header() };
+    match scope {
+        Some(s) => format!(" {s} ·{base}"),
+        None => base,
+    }
+}
+
 fn order_path() -> String {
     let tmp = std::env::var("TMPDIR")
         .ok()
@@ -765,13 +839,18 @@ fn order_path() -> String {
 pub fn order_mode() -> Order {
     match std::fs::read_to_string(order_path()).as_deref().map(str::trim) {
         Ok("session") => Order::Session,
+        Ok("visited") => Order::Visited,
         _ => Order::Recency,
     }
 }
 
+/// ctrl-g cycles the three orders. Visited sits next to recency because it is
+/// the same question asked properly — both mean "where was I?", but one times
+/// output and the other times attention, so you reach for it when recency lies.
 pub fn toggle_order() -> Order {
     let next = match order_mode() {
-        Order::Recency => Order::Session,
+        Order::Recency => Order::Visited,
+        Order::Visited => Order::Session,
         Order::Session => Order::Recency,
     };
     let _ = std::fs::write(order_path(), order_label(next));
@@ -786,23 +865,32 @@ pub fn toggle_order() -> Order {
 /// stable — silently degenerates to tmux's listing order. The session's
 /// last-attached time breaks those ties, so windows in the session you were
 /// actually in come first.
+///
+/// Three keys now, the visit stamp first: visited order leads with it and falls
+/// back to the same recency pair, so a window never visited still lands
+/// somewhere sensible — and a server that has stamped nothing reads as recency.
 fn strip_sort_keys(raw: &str, mode: Order) -> String {
-    let mut rows: Vec<(i64, i64, &str)> = raw
+    let mut rows: Vec<(i64, i64, i64, &str)> = raw
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| {
-            let (a, rest) = l.split_once(' ').unwrap_or(("0", l));
+            let (v, rest) = l.split_once(' ').unwrap_or(("0", l));
+            let (a, rest) = rest.split_once(' ').unwrap_or(("0", rest));
             let (b, rest) = rest.split_once(' ').unwrap_or(("0", rest));
-            (a.parse().unwrap_or(0), b.parse().unwrap_or(0), rest)
+            (v.parse().unwrap_or(0), a.parse().unwrap_or(0), b.parse().unwrap_or(0), rest)
         })
         .collect();
-    // Session order is tmux's own listing order, so leave it alone; only recency
-    // reorders. Both drop the keys.
-    if mode == Order::Recency {
-        rows.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| y.1.cmp(&x.1)));
+    // Session order is tmux's own listing order, so leave it alone; the other
+    // two reorder. All three drop the keys.
+    match mode {
+        Order::Recency => rows.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| y.2.cmp(&x.2))),
+        Order::Visited => rows.sort_by(|x, y| {
+            y.0.cmp(&x.0).then_with(|| y.1.cmp(&x.1)).then_with(|| y.2.cmp(&x.2))
+        }),
+        Order::Session => {}
     }
     rows.into_iter()
-        .map(|(_, _, r)| r)
+        .map(|(_, _, _, r)| r)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -966,6 +1054,22 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
     }
 
     #[test]
+    fn a_narrowed_picker_names_its_session_first() {
+        // prefix w's picker is prefix b's with fewer rows — identical columns,
+        // keys and preview — so the session name is the only thing on screen
+        // that says which one you are looking at. It leads, and the rest of the
+        // label survives underneath it whichever view is narrowed.
+        let wide = picker_header(false, None);
+        let narrow = picker_header(false, Some("cosmos-sonet"));
+        assert!(narrow.starts_with(" cosmos-sonet ·"), "got {narrow:?}");
+        assert!(narrow.ends_with(&wide), "base label lost: {narrow:?}");
+
+        let alerts = picker_header(true, Some("rc"));
+        assert!(alerts.starts_with(" rc ·"), "got {alerts:?}");
+        assert!(alerts.contains("[!] bell"), "alerts markers lost: {alerts:?}");
+    }
+
+    #[test]
     fn the_window_you_are_on_leads_the_content_order() {
         // The real shape of the bug: every window ahead of the current one is a
         // Claude/k9s pane restamping its activity every second, so "recency"
@@ -1011,8 +1115,9 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
     }
 
     #[test]
-    fn recency_is_descending_and_strips_both_keys() {
-        let raw = "100 1 alpha\n300 1 gamma\n200 1 beta\n";
+    fn recency_is_descending_and_strips_every_key() {
+        // Rows are `<visit stamp> <activity> <last attached> <rest>`.
+        let raw = "0 100 1 alpha\n0 300 1 gamma\n0 200 1 beta\n";
         assert_eq!(strip_sort_keys(raw, Order::Recency), "gamma\nbeta\nalpha");
     }
 
@@ -1021,7 +1126,7 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
         // The case that matters in practice: animated panes (a Claude spinner,
         // k9s) all stamp the same activity second, so the first key ties and the
         // session you were last in has to decide.
-        let raw = "500 10 old-session\n500 90 recent-session\n500 50 mid-session\n";
+        let raw = "0 500 10 old-session\n0 500 90 recent-session\n0 500 50 mid-session\n";
         assert_eq!(
             strip_sort_keys(raw, Order::Recency),
             "recent-session\nmid-session\nold-session"
@@ -1030,13 +1135,47 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
 
     #[test]
     fn session_order_keeps_tmux_listing_order_and_still_strips_keys() {
-        let raw = "100 1 alpha\n300 9 gamma\n200 5 beta\n";
+        let raw = "0 100 1 alpha\n0 300 9 gamma\n0 200 5 beta\n";
         assert_eq!(strip_sort_keys(raw, Order::Session), "alpha\ngamma\nbeta");
     }
 
     #[test]
-    fn a_missing_second_key_degrades_without_eating_the_row() {
-        // Defensive: a one-key line must still yield its content, not swallow it.
+    fn a_missing_key_degrades_without_eating_the_row() {
+        // Defensive: a short line must still yield its content, not swallow it.
         assert_eq!(strip_sort_keys("100 alpha\n", Order::Recency), "alpha");
+    }
+
+    #[test]
+    fn visited_ranks_by_attention_not_by_the_last_attached_session() {
+        // The complaint this order exists for: recency puts every window of the
+        // session you last attached on top (b: and c: here, on 900), burying the
+        // one you were actually reading (a:1, the newest visit stamp).
+        let raw = "9 500 10 a:1\tnvim\n0 500 900 b:2\tclaude\n4 500 900 c:3\tk9s\n";
+        assert_eq!(
+            strip_sort_keys(raw, Order::Visited),
+            "a:1\tnvim\nc:3\tk9s\nb:2\tclaude"
+        );
+    }
+
+    #[test]
+    fn a_never_visited_window_falls_back_to_recency_rather_than_list_order() {
+        // Nothing stamped yet — a fresh server, or any window the hook has not
+        // seen — must read exactly as recency rather than as tmux's own order.
+        let raw = "0 100 1 alpha\n0 300 1 gamma\n0 200 1 beta\n";
+        assert_eq!(
+            strip_sort_keys(raw, Order::Visited),
+            strip_sort_keys(raw, Order::Recency)
+        );
+    }
+
+    #[test]
+    fn the_three_order_labels_are_what_the_border_shows() {
+        // These strings are both the picker's label and what order_mode reads
+        // back off disk, so the pair has to agree.
+        let labels: Vec<&str> = [Order::Recency, Order::Visited, Order::Session]
+            .iter()
+            .map(|o| order_label(*o))
+            .collect();
+        assert_eq!(labels, ["recency", "visited", "session"]);
     }
 }

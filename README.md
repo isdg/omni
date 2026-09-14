@@ -104,9 +104,9 @@ window is hoisted to the front and the rest keep their recency order.
 
 ### Window order
 
-The window picker opens **recency first** and `ctrl-g` toggles to **session
-order** (tmux's own: session name, then window index). The header names the
-active one, and the choice persists.
+The window picker opens **recency first**, and `ctrl-g` cycles it through
+**visited** and then **session order** (tmux's own: session name, then window
+index). The header names the active one, and the choice persists.
 
 Recency sorts on `#{window_activity}`, then on the session's last-attached time.
 The second key is not decoration: any pane running an animated TUI — a Claude
@@ -115,12 +115,51 @@ the first key and a stable sort quietly degenerates into tmux's listing order.
 Breaking the tie by the session you were last in is what makes recency mean
 anything on a busy server.
 
+### Visited
+
+Recency has a deeper problem than its tiebreaker: `#{window_activity}` times
+**output**, not attention. A pane running `claude` or `k9s` restamps itself every
+second and sits at the top of a list meant to answer "where was I?", while the
+window you were reading — quiet, because reading makes no output — sinks. The
+last-attached tiebreaker then finishes the job, hoisting every window of the
+session you attached last, used or not.
+
+`visited` order ranks by when you were last **on** a window, and falls back to
+the same recency pair for windows never visited — so it is never worse than the
+order it replaces, and a server that has recorded nothing reads identically.
+
+tmux does not track this either, and it has to be recorded as it happens, so the
+whole mechanism is two hooks:
+
+```tmux
+set-hook -g after-select-window 'set -gF @seq "#{e|+:#{@seq},1}" ; set -wF @seen "#{@seq}"'
+set-hook -g client-session-changed 'set -gF @seq "#{e|+:#{@seq},1}" ; set -wF @seen "#{@seq}"'
+```
+
+`@seq` is a global ticket counter and `@seen` the ticket a window last drew, so
+the highest `@seen` is where you were most recently. `-F` is what makes `set`
+expand the format rather than store it verbatim, and the two commands run in
+order, so `@seen` reads the ticket just drawn. **No shell is involved** — tmux
+does its own arithmetic, so a window switch spawns nothing, and `omni windows`
+reads `@seen` as one more column of the `list-windows` it already runs.
+
+The two hooks are the minimal pair covering every way a window changes:
+`after-select-window` for a move inside a session, `client-session-changed` for
+crossing to another one — including a `switch-client` landing on a window already
+current, where no window-changed hook fires at all.
+
+Two things worth knowing. The stamps live on the window, so they follow it
+through a rename or a renumber (`renumber-windows on` shifts every index after a
+kill) and vanish with it — no stale entries, nothing to prune. And they are
+server state, so they reset when the server does, falling back to recency until
+you have moved around a little.
+
 Both pickers share one layout — list on top, the input line under it, preview
 below, the shape of nvim's buffer picker — with fzf's chrome stripped to a single
 pointer on the current row. It lives in `tmux::pick`, so every picker wears it and
 a new one gets it for free.
 
-`prefix w` (choose-tree) is left untouched — `b` is the fzf-powered
+`prefix W` (choose-tree) is left untouched — `b` is the fzf-powered
 alternative, not a replacement.
 
 ## Files
