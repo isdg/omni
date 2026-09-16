@@ -46,8 +46,8 @@ run-shell 'OMNI="$(command -v omni || echo "$HOME/.cargo/bin/omni")"; \
 | `prefix b` | fuzzy-jump to any window across all sessions, most-recently-active first; `ctrl-g` toggles to session order (fzf popup, live preview) |
 | `prefix a` | fuzzy-search the *content* of every window **in this session** — screen and scrollback — and jump to the matched **line** |
 | `prefix A` | same as `a`, over **every session** rather than just this one |
-| `prefix P` | capture current pane's scrollback into a new window, open in `less` |
-| `prefix j` | capture current pane's scrollback into a new window, open in `nvim` (colors preserved via [baleia.nvim](https://github.com/m00qek/baleia.nvim), if installed) |
+| `prefix P` | capture current pane's scrollback, open in `less` |
+| `prefix j` | capture current pane's scrollback, open in `nvim` (colors preserved via [baleia.nvim](https://github.com/m00qek/baleia.nvim), if installed) |
 | `prefix J` | same as `j`, but strips colors — plain text in `nvim` |
 
 ### Scope is the only difference between the two keys
@@ -101,6 +101,32 @@ window came *sixth*, behind five chattier ones, and since `--tiebreak=index`
 settles a score tie in favour of the earlier row, searching for text you could
 see on screen jumped you to an identical line somewhere else. So the current
 window is hoisted to the front and the rest keep their recency order.
+
+### Capture in place
+
+```sh
+tmux set -g @capture-overlay on     # off, the default, opens a window instead
+```
+
+With it on, `prefix j`/`J` open the capture in a **popup pinned over the pane it
+came from** — same size, same position, same first visible line — so reading
+your own scrollback costs no window and no layout. Quitting puts the pane back
+exactly as it was. The window it replaces is still one keystroke away: **`P`
+promotes** the capture to a window of its own, at the line under the cursor, for
+when a look turns into work.
+
+The popup drops nvim's gutter, statusline, cmdline and `scrolloff`. That is not
+taste: each of them shifts the text against the lines it is drawn over, and the
+whole point of the mode is that the capture lands where the output was. The
+window path leaves your editor's own settings alone, as before.
+
+While a capture is up its window carries a `@capture` flag, which a status
+format can render — the name reversed, say, so the status line distinguishes the
+window you are *reading* from the one you are living in:
+
+```tmux
+set -g window-status-format "#I:#{?@capture,#[reverse]#W#[default],#W}"
+```
 
 ### Window order
 

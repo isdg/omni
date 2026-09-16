@@ -4,7 +4,8 @@
 //!                  --session: only this session's windows          (prefix w)
 //!   omni content   fuzzy-search this session: screen + scrollback  (prefix a)
 //!                  --all: every session, not just this one         (prefix A)
-//!   omni capture   capture this pane's scrollback into a new window (prefix j/J/P)
+//!   omni capture   this pane's scrollback, to read      (prefix j/J/P)
+//!                  in a window, or a popup over the pane it came from
 //!
 //! The `.tmux` bindings are one-liners that call these; the per-prompt env
 //! snapshot that `capture` consumes stays in zsh (see zsh/omni.zsh).
@@ -82,7 +83,11 @@ enum Cmd {
         /// The `session:index` window target (fzf field 1) to kill.
         target: String,
     },
-    /// Capture the current pane's scrollback into a new window.
+    /// Capture the current pane's scrollback and open it to read.
+    ///
+    /// Lands in a new window, or -- with `tmux set -g @capture-overlay on` --
+    /// in a popup pinned over the pane it came from, which P promotes to a
+    /// window if the reading turns into work.
     Capture {
         /// Viewer for the captured text.
         #[arg(long, value_enum, default_value_t = Pager::Nvim)]
@@ -723,19 +728,19 @@ fn capture(pager: Pager, target: Option<String>) -> Result<()> {
     std::fs::File::create(&path)?.write_all(&cleaned)?;
     let path = path.to_string_lossy().into_owned();
 
+    // Where the capture goes. @capture-overlay on pins it over the pane it came
+    // from -- no window, no layout change, and quitting puts you back exactly
+    // where you were reading. Off, the default, is the window below.
+    if overlay_enabled() {
+        let geom = dm("#{pane_width} #{pane_height} #{pane_left} #{pane_top} #{window_id}")?;
+        return overlay(pager, &path, &pos, &cwd, &pane_id, &geom);
+    }
+
     // No `set nowrap`/`set number`: the capture window should read like the
     // editor you already configured. Forcing nowrap silently clipped the tail of
     // every full-width line, because the number gutter narrows the text area
     // below the pane width the content was captured at.
-    let shell = match pager {
-        Pager::Plain => format!("nvim -n -c '{pos}' '{path}'"),
-        Pager::Less => format!("less -RN +G '{path}'"),
-        Pager::Nvim => format!(
-            "nvim -n \
-             -c 'lua pcall(function() require([[baleia]]).setup().once(0) end)' \
-             -c '{pos}' '{path}'"
-        ),
-    };
+    let shell = viewer(pager, &path, &pos, "");
 
     let mut args: Vec<String> = vec!["new-window".into(), "-c".into(), cwd];
     for kv in env::records(&pane_id) {
@@ -743,6 +748,171 @@ fn capture(pager: Pager, target: Option<String>) -> Result<()> {
         args.push(kv);
     }
     args.push(shell);
+    tmux::run(&args)
+}
+
+/// Is the capture meant to land in a popup over its pane rather than a window?
+///
+/// A tmux option rather than a flag or a config file of omni's own: the keys are
+/// declared in tmux.conf, the reader is a tmux popup, and `tmux set -g
+/// @capture-overlay on` toggles it live without touching a binding.
+fn overlay_enabled() -> bool {
+    tmux::query(["show", "-gv", "@capture-overlay"])
+        .map(|v| v.trim() == "on")
+        .unwrap_or(false)
+}
+
+/// The pager command line, shared by every way a capture can be opened so they
+/// cannot drift. `extra` carries the options only the popup wants.
+///
+/// Every string inside is a Lua long bracket or bare: the whole command is
+/// wrapped in single quotes on its way through tmux, so a single quote anywhere
+/// in here ends the argument early.
+fn viewer(pager: Pager, path: &str, pos: &str, extra: &str) -> String {
+    match pager {
+        Pager::Less => format!("less -RN +G '{path}'"),
+        Pager::Plain => format!("nvim -n {extra} -c '{pos}' '{path}'"),
+        Pager::Nvim => format!(
+            "nvim -n \
+             -c 'lua pcall(function() require([[baleia]]).setup().once(0) end)' \
+             {extra} -c '{pos}' '{path}'"
+        ),
+    }
+}
+
+/// Pane geometry for a popup that has to sit exactly on top of it.
+struct Geom {
+    w: String,
+    h: String,
+    x: String,
+    y: String,
+    win: String,
+}
+
+/// Parse `#{pane_width} #{pane_height} #{pane_left} #{pane_top} #{window_id}`.
+/// Anything missing means no popup can be placed, so the caller falls back.
+fn parse_geom(s: &str) -> Option<Geom> {
+    let mut it = s.split_whitespace();
+    let mut next = || it.next().filter(|f| !f.is_empty()).map(str::to_string);
+    Some(Geom {
+        w: next()?,
+        h: next()?,
+        x: next()?,
+        y: next()?,
+        win: next()?,
+    })
+}
+
+/// The `-c` options that make nvim look like the pane it is covering.
+///
+/// Every row and column of editor furniture shifts the text against the lines
+/// underneath it, which is the one thing this mode cannot afford: no gutter, no
+/// statusline, no cmdline. scrolloff is the subtle one -- with it set, `zt`
+/// keeps context above the cursor and the view opens that many lines early.
+///
+/// P promotes: it writes the line under the cursor to `flag` and quits, and the
+/// caller reads that as "reopen this, as a window, there". A popup takes the
+/// client's input so the prefix never reaches tmux; the key has to live in nvim.
+/// Buffer-local, and P because paste-before is the one normal-mode key that pane
+/// output has no use for.
+fn overlay_opts(flag: &str) -> String {
+    format!(
+        "-c 'set laststatus=0 cmdheight=0 scrolloff=0' \
+         -c 'setlocal nonumber norelativenumber signcolumn=no' \
+         -c 'lua vim.keymap.set([[n]],[[P]],function() \
+         vim.fn.writefile({{tostring(vim.fn.line([[.]]))}},[[{flag}]]) \
+         vim.cmd([[qa!]]) end,{{buffer=true,desc=[[capture: promote to a window]]}})'"
+    )
+}
+
+/// Open the capture in a popup pinned to the pane, and promote it to a window if
+/// P asked for that.
+///
+/// -B is what makes the size exact: a bordered popup is two cells smaller each
+/// way. -x/-y are client coordinates while pane_left/pane_top are window ones,
+/// which agree only while the status line is at the bottom.
+///
+/// @capture marks the window for as long as the popup is up, so the status line
+/// can say which window you are reading rather than living in (see
+/// window-status-format). A flag, not a rename: the name goes on saying what is
+/// running, and rename-window would turn automatic-rename off as a side effect.
+fn overlay(
+    pager: Pager,
+    path: &str,
+    pos: &str,
+    cwd: &str,
+    pane_id: &str,
+    geom: &str,
+) -> Result<()> {
+    let Some(g) = parse_geom(geom) else {
+        // No geometry, no popup: a window still shows the capture.
+        let shell = viewer(pager, path, pos, "");
+        let mut args: Vec<String> = vec!["new-window".into(), "-c".into(), cwd.into()];
+        for kv in env::records(pane_id) {
+            args.push("-e".into());
+            args.push(kv);
+        }
+        args.push(shell);
+        return tmux::run(&args);
+    };
+
+    let flag = format!("{path}.promote");
+    let _ = std::fs::remove_file(&flag);
+
+    let mut args: Vec<String> = vec![
+        "display-popup".into(),
+        "-B".into(),
+        "-E".into(),
+        "-d".into(),
+        cwd.into(),
+        "-w".into(),
+        g.w,
+        "-h".into(),
+        g.h,
+        "-x".into(),
+        g.x,
+        "-y".into(),
+        g.y,
+    ];
+    for kv in env::records(pane_id) {
+        args.push("-e".into());
+        args.push(kv);
+    }
+    args.push(viewer(pager, path, pos, &overlay_opts(&flag)));
+
+    tmux::run(["set", "-w", "-t", &g.win, "@capture", "1"])?;
+    // display-popup blocks until the popup closes, so the flag is unset and the
+    // promotion decided once the reader has quit.
+    let shown = tmux::run(&args);
+    tmux::run(["set", "-wu", "-t", &g.win, "@capture"])?;
+    shown?;
+
+    let Ok(line) = std::fs::read_to_string(&flag) else {
+        // Read and dropped: nothing refers to the capture any more. The window
+        // path leaves its file behind on purpose -- the window still has it open.
+        let _ = std::fs::remove_file(path);
+        return Ok(());
+    };
+    let _ = std::fs::remove_file(&flag);
+
+    // A window, not a split: the layout the capture came from is left exactly as
+    // it was, and full width is never narrower than the pane the lines were
+    // wrapped to, so nothing re-wraps. -a puts it beside the window it came from,
+    // and the target must be a window id -- new-window refuses a pane one.
+    let pos = format!("normal! {}Gzz", line.trim());
+    let mut args: Vec<String> = vec![
+        "new-window".into(),
+        "-a".into(),
+        "-t".into(),
+        g.win,
+        "-c".into(),
+        cwd.into(),
+    ];
+    for kv in env::records(pane_id) {
+        args.push("-e".into());
+        args.push(kv);
+    }
+    args.push(viewer(pager, path, &pos, ""));
     tmux::run(&args)
 }
 
@@ -962,6 +1132,70 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
         assert_eq!(top_line(398, Some(500)), 1);
         // Empty history: the whole capture is the visible screen.
         assert_eq!(top_line(0, None), 1);
+    }
+
+    #[test]
+    fn every_pager_opens_the_same_file_at_the_same_line() {
+        // The window and the popup share this builder so they cannot drift into
+        // opening the capture two different ways.
+        let pos = "normal! 399Gzt";
+        for p in [Pager::Nvim, Pager::Plain] {
+            let cmd = viewer(p, "/tmp/cap", pos, "");
+            assert!(cmd.contains("'/tmp/cap'"), "{cmd}");
+            assert!(cmd.contains(&format!("-c '{pos}'")), "{cmd}");
+        }
+        // Colour is the whole difference between the two nvim pagers.
+        assert!(viewer(Pager::Nvim, "/tmp/cap", pos, "").contains("baleia"));
+        assert!(!viewer(Pager::Plain, "/tmp/cap", pos, "").contains("baleia"));
+        // less has no -c to give, so the overlay's options are dropped rather
+        // than pasted somewhere they would be read as filenames.
+        let less = viewer(Pager::Less, "/tmp/cap", pos, &overlay_opts("/tmp/cap.promote"));
+        assert_eq!(less, "less -RN +G '/tmp/cap'");
+    }
+
+    #[test]
+    fn the_overlay_options_survive_the_trip_through_tmux_quoting() {
+        // The command is wrapped in single quotes on its way through tmux, so a
+        // single quote anywhere inside ends the argument early and the rest of
+        // the mapping lands in the shell. Every string here is a Lua long
+        // bracket for that reason; this is the test that keeps it that way.
+        let opts = overlay_opts("/tmp/cap.promote");
+        let inside: String = opts
+            .split(" -c '")
+            .skip(1)
+            .map(|chunk| chunk.rsplit_once('\'').map(|(body, _)| body).unwrap_or(chunk))
+            .collect();
+        assert!(!inside.contains('\''), "single quote inside a -c body: {inside}");
+        assert!(opts.contains("[[/tmp/cap.promote]]"), "{opts}");
+    }
+
+    #[test]
+    fn the_overlay_strips_the_furniture_that_would_shift_the_text() {
+        // Each of these moves the capture against the pane it is drawn over:
+        // two gutters sideways, a statusline and cmdline upward, and scrolloff
+        // opens the view early because zt keeps context above the cursor.
+        let opts = overlay_opts("/tmp/f");
+        for needed in [
+            "nonumber",
+            "norelativenumber",
+            "signcolumn=no",
+            "laststatus=0",
+            "cmdheight=0",
+            "scrolloff=0",
+        ] {
+            assert!(opts.contains(needed), "overlay lost {needed}: {opts}");
+        }
+    }
+
+    #[test]
+    fn geometry_is_all_five_fields_or_none_of_them() {
+        let g = parse_geom("80 24 0 0 @3").expect("five fields");
+        assert_eq!((g.w, g.h, g.x, g.y, g.win), ("80".into(), "24".into(),
+            "0".into(), "0".into(), "@3".into()));
+        // A short answer means tmux could not resolve the pane; the caller opens
+        // a window instead of placing a popup at a guessed size.
+        assert!(parse_geom("80 24 0 0").is_none());
+        assert!(parse_geom("").is_none());
     }
 
     // The numbers below were read off a real pane (tmux 3.6a, hist 278,
