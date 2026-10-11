@@ -5,7 +5,7 @@
 //!   omni content   fuzzy-search this session: screen + scrollback  (prefix a)
 //!                  --all: every session, not just this one         (prefix A)
 //!   omni capture   this pane's scrollback, to read      (prefix j/J/P)
-//!                  in a window, or a popup over the pane it came from
+//!                  in a window, a popup over the pane, or the pane's own slot
 //!
 //! The `.tmux` bindings are one-liners that call these; the per-prompt env
 //! snapshot that `capture` consumes stays in zsh (see zsh/omni.zsh).
@@ -85,9 +85,9 @@ enum Cmd {
     },
     /// Capture the current pane's scrollback and open it to read.
     ///
-    /// Lands in a new window, or -- with `tmux set -g @capture-overlay on` --
-    /// in a popup pinned over the pane it came from, which P promotes to a
-    /// window if the reading turns into work.
+    /// Lands in a new window; with `tmux set -g @capture-overlay pane` in a
+    /// pane swapped into the slot of the one it came from, or with `on` in a
+    /// popup pinned over it. Either way P promotes it to a window.
     Capture {
         /// Viewer for the captured text.
         #[arg(long, value_enum, default_value_t = Pager::Nvim)]
@@ -97,9 +97,36 @@ enum Cmd {
         #[arg(long)]
         target: Option<String>,
     },
+    /// Put a pane back after its in-place capture is read; run by the capture
+    /// pane itself on quit, or by its after-kill-pane hook.
+    #[command(hide = true)]
+    Restore {
+        /// The pane the capture stood in for, held meanwhile in a session of
+        /// its own.
+        #[arg(long)]
+        pane: String,
+        /// The window the capture covered, its session, and the pane's index.
+        #[arg(long)]
+        window: String,
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        index: u32,
+        /// `#{window_layout}` at capture time, for when the slot is gone.
+        #[arg(long)]
+        layout: String,
+        /// The captured text, and the viewer a promoted window reopens it in.
+        #[arg(long)]
+        path: String,
+        #[arg(long, value_enum)]
+        pager: Pager,
+        /// The capture pane was killed, so its slot left the layout with it.
+        #[arg(long)]
+        killed: bool,
+    },
 }
 
-#[derive(Copy, Clone, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, ValueEnum)]
 enum Pager {
     /// nvim, colors preserved via baleia (prefix j)
     Nvim,
@@ -125,6 +152,10 @@ fn main() -> Result<()> {
         Cmd::Peek { target } => peek(&target),
         Cmd::Kill { target } => kill_window(&target),
         Cmd::Capture { pager, target } => capture(pager, target),
+        Cmd::Restore { pane, window, session, index, layout, path, pager, killed } => {
+            let held = Held { pane, window, session, index, layout };
+            restore(&held, &path, pager, killed)
+        }
     }
 }
 
@@ -728,12 +759,16 @@ fn capture(pager: Pager, target: Option<String>) -> Result<()> {
     std::fs::File::create(&path)?.write_all(&cleaned)?;
     let path = path.to_string_lossy().into_owned();
 
-    // Where the capture goes. @capture-overlay on pins it over the pane it came
-    // from -- no window, no layout change, and quitting puts you back exactly
-    // where you were reading. Off, the default, is the window below.
-    if overlay_enabled() {
-        let geom = dm("#{pane_width} #{pane_height} #{pane_left} #{pane_top} #{window_id}")?;
-        return overlay(pager, &path, &pos, &cwd, &pane_id, &geom);
+    // Where the capture goes. pane and on both land it where the output was --
+    // no window, no layout change -- and quitting puts you back exactly where
+    // you were reading. Off, the default, is the window below.
+    match landing() {
+        Landing::Pane => return in_place(pager, &path, &pos, &cwd, &pane_id),
+        Landing::Popup => {
+            let geom = dm("#{pane_width} #{pane_height} #{pane_left} #{pane_top} #{window_id}")?;
+            return overlay(pager, &path, &pos, &cwd, &pane_id, &geom);
+        }
+        Landing::Window => {}
     }
 
     // No `set nowrap`/`set number`: the capture window should read like the
@@ -751,15 +786,30 @@ fn capture(pager: Pager, target: Option<String>) -> Result<()> {
     tmux::run(&args)
 }
 
-/// Is the capture meant to land in a popup over its pane rather than a window?
+#[derive(Debug, PartialEq)]
+enum Landing {
+    Window,
+    Popup,
+    Pane,
+}
+
+/// Where `@capture-overlay` says a capture lands.
 ///
 /// A tmux option rather than a flag or a config file of omni's own: the keys are
-/// declared in tmux.conf, the reader is a tmux popup, and `tmux set -g
-/// @capture-overlay on` toggles it live without touching a binding.
-fn overlay_enabled() -> bool {
-    tmux::query(["show", "-gv", "@capture-overlay"])
-        .map(|v| v.trim() == "on")
-        .unwrap_or(false)
+/// declared in tmux.conf and `tmux set -g @capture-overlay pane` toggles it live
+/// without touching a binding.
+fn landing() -> Landing {
+    parse_landing(&tmux::query(["show", "-gv", "@capture-overlay"]).unwrap_or_default())
+}
+
+/// `on` stays the popup it always meant, so a config written before `pane`
+/// existed keeps what it asked for; anything unknown is the plain window.
+fn parse_landing(v: &str) -> Landing {
+    match v.trim() {
+        "pane" => Landing::Pane,
+        "on" | "popup" => Landing::Popup,
+        _ => Landing::Window,
+    }
 }
 
 /// The pager command line, shared by every way a capture can be opened so they
@@ -880,16 +930,29 @@ fn overlay(
     }
     args.push(viewer(pager, path, pos, &overlay_opts(&flag)));
 
-    tmux::run(["set", "-w", "-t", &g.win, "@capture", "1"])?;
+    mark(&g.win)?;
     // display-popup blocks until the popup closes, so the flag is unset and the
     // promotion decided once the reader has quit.
     let shown = tmux::run(&args);
     tmux::run(["set", "-wu", "-t", &g.win, "@capture"])?;
     shown?;
+    promote_or_drop(pager, path, &g.win, cwd, pane_id)
+}
 
+/// Set @capture on the window to its name as it stands. The status line shows
+/// that instead of #W: with automatic-rename on, a capture pane swapped in
+/// would otherwise rename the window after the viewer.
+fn mark(win: &str) -> Result<()> {
+    let name = tmux::query(["display-message", "-p", "-t", win, "#{window_name}"])?;
+    tmux::run(["set", "-w", "-t", win, "@capture", &name])
+}
+
+/// After the reader quits: reopen the capture as a window if P asked for one,
+/// else delete it -- nothing refers to the file any more. The window path keeps
+/// its file on purpose, since the window still has it open.
+fn promote_or_drop(pager: Pager, path: &str, win: &str, cwd: &str, pane_id: &str) -> Result<()> {
+    let flag = format!("{path}.promote");
     let Ok(line) = std::fs::read_to_string(&flag) else {
-        // Read and dropped: nothing refers to the capture any more. The window
-        // path leaves its file behind on purpose -- the window still has it open.
         let _ = std::fs::remove_file(path);
         return Ok(());
     };
@@ -900,20 +963,167 @@ fn overlay(
     // wrapped to, so nothing re-wraps. -a puts it beside the window it came from,
     // and the target must be a window id -- new-window refuses a pane one.
     let pos = format!("normal! {}Gzz", line.trim());
-    let mut args: Vec<String> = vec![
-        "new-window".into(),
-        "-a".into(),
-        "-t".into(),
-        g.win,
-        "-c".into(),
-        cwd.into(),
-    ];
+    let mut args: Vec<String> = vec!["new-window".into()];
+    if exists(win) {
+        args.extend(["-a".into(), "-t".into(), win.into()]);
+    }
+    args.extend(["-c".into(), cwd.into()]);
     for kv in env::records(pane_id) {
         args.push("-e".into());
         args.push(kv);
     }
     args.push(viewer(pager, path, &pos, ""));
     tmux::run(&args)
+}
+
+/// Does tmux still resolve this pane or window target?
+fn exists(target: &str) -> bool {
+    tmux::query(["display-message", "-p", "-t", target, "#{pane_id}"])
+        .is_ok_and(|id| !id.is_empty())
+}
+
+/// Where a pane in its capture's holding session came from, and what puts it
+/// back: the slot itself while the capture is in it, the layout once it is not.
+struct Held {
+    pane: String,
+    window: String,
+    session: String,
+    index: u32,
+    layout: String,
+}
+
+impl Held {
+    /// The `omni restore` call that puts this pane back, quoted for `sh -c`.
+    /// Nothing here can hold a single quote: ids, a number, a layout string
+    /// made of digits and `x,[]{}`, a temp path and a pager name.
+    fn restore_cmd(&self, exe: &str, path: &str, pager: Pager, killed: bool) -> String {
+        let pager = pager.to_possible_value().map(|v| v.get_name().to_string());
+        format!(
+            "'{exe}' restore --pane '{}' --window '{}' --session '{}' --index {} \
+             --layout '{}' --path '{path}' --pager {}{}",
+            self.pane,
+            self.window,
+            self.session,
+            self.index,
+            self.layout,
+            pager.unwrap_or_default(),
+            if killed { " --killed" } else { "" },
+        )
+    }
+}
+
+/// Open the capture in a real pane swapped into the slot of the one it came
+/// from. Unlike the popup it takes no input from the client, so the prefix and
+/// every other pane stay live while you read.
+///
+/// The pane moves to a detached session sized exactly like the slot, so it is
+/// never resized: no SIGWINCH, no reflowed scrollback, nothing to redraw. The
+/// viewer swaps it back when it quits; if the capture pane is killed instead,
+/// its after-kill-pane hook rejoins it and reapplies the layout saved here.
+fn in_place(pager: Pager, path: &str, pos: &str, cwd: &str, pane_id: &str) -> Result<()> {
+    let q = |fmt: &str| tmux::query(["display-message", "-p", "-t", pane_id, fmt]);
+    let geom = q("#{pane_width} #{pane_height} #{pane_index} #{window_id} #{session_id} \
+                  #{window_layout}")?;
+    let f: Vec<&str> = geom.split_whitespace().collect();
+    let [w, h, index, win, session, layout] = f[..] else {
+        let geom = q("#{pane_width} #{pane_height} #{pane_left} #{pane_top} #{window_id}")?;
+        return overlay(pager, path, pos, cwd, pane_id, &geom);
+    };
+    let Ok(index) = index.parse() else {
+        let geom = q("#{pane_width} #{pane_height} #{pane_left} #{pane_top} #{window_id}")?;
+        return overlay(pager, path, pos, cwd, pane_id, &geom);
+    };
+    let held = Held {
+        pane: pane_id.into(),
+        window: win.to_string(),
+        session: session.to_string(),
+        index,
+        layout: layout.to_string(),
+    };
+    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    let flag = format!("{path}.promote");
+    let _ = std::fs::remove_file(&flag);
+
+    let shell = format!(
+        "{}; {}",
+        viewer(pager, path, pos, &overlay_opts(&flag)),
+        held.restore_cmd(&exe, path, pager, false),
+    );
+    let mut args: Vec<String> = vec![
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        format!("capture-{}", std::process::id()),
+        "-x".into(),
+        w.to_string(),
+        "-y".into(),
+        h.to_string(),
+        "-c".into(),
+        cwd.into(),
+        "-P".into(),
+        "-F".into(),
+        "#{pane_id}".into(),
+    ];
+    for kv in env::records(pane_id) {
+        args.push("-e".into());
+        args.push(kv);
+    }
+    args.push(shell);
+    let cap = tmux::query(&args)?;
+    if cap.is_empty() {
+        let _ = std::fs::remove_file(path);
+        anyhow::bail!("tmux would not start the capture pane");
+    }
+
+    let hook = format!("run-shell -b \"{}\"", held.restore_cmd(&exe, path, pager, true));
+    tmux::run(["set-hook", "-p", "-t", &cap, "after-kill-pane", &hook])?;
+    mark(win)?;
+    // -Z: a zoomed pane stays zoomed with the capture in its place.
+    tmux::run(["swap-pane", "-Z", "-s", &cap, "-t", pane_id])
+}
+
+/// Put a held pane back where its capture stood, then promote or drop the text.
+fn restore(held: &Held, path: &str, pager: Pager, killed: bool) -> Result<()> {
+    let _ = tmux::run(["set", "-wu", "-t", &held.window, "@capture"]);
+    let cwd = tmux::query(["display-message", "-p", "-t", &held.pane, "#{pane_current_path}"])
+        .unwrap_or_default();
+    if !exists(&held.pane) {
+        // The pane ended while it was held; there is nothing to put back.
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{path}.promote"));
+        return Ok(());
+    }
+
+    if !killed {
+        // Run from inside the capture pane, which still holds the slot.
+        let cap = std::env::var("TMUX_PANE").unwrap_or_default();
+        tmux::run(["swap-pane", "-Z", "-s", &cap, "-t", &held.pane])?;
+    } else if exists(&held.window) {
+        // The slot went with the pane. Rejoin beside the pane that preceded it,
+        // so the pane order matches the saved layout, then reapply that layout.
+        // If the window changed shape meanwhile the layout no longer fits, and
+        // the pane stays joined wherever tmux put it.
+        let (before, at) = match held.index {
+            0 => (true, 0),
+            i => (false, i - 1),
+        };
+        let target = format!("{}.{at}", held.window);
+        let mut join = vec!["join-pane", "-d", "-s", &held.pane, "-t", &target];
+        if before {
+            join.push("-b");
+        }
+        if !tmux::ok(&join) {
+            tmux::run(["join-pane", "-d", "-s", &held.pane, "-t", &held.window])?;
+        }
+        let _ = tmux::run(["select-layout", "-t", &held.window, &held.layout]);
+        tmux::run(["select-pane", "-t", &held.pane])?;
+    } else {
+        // The capture was the window's only pane and took the window with it:
+        // the pane comes back as a window of its own.
+        let to = format!("{}:", held.session);
+        tmux::run(["break-pane", "-s", &held.pane, "-t", &to])?;
+    }
+    promote_or_drop(pager, path, &held.window, &cwd, &held.pane)
 }
 
 /// The buffer line a capture should open on: the pane's first visible line, so
@@ -1185,6 +1395,38 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
         ] {
             assert!(opts.contains(needed), "overlay lost {needed}: {opts}");
         }
+    }
+
+    #[test]
+    fn on_keeps_meaning_the_popup_and_pane_is_its_own_landing() {
+        assert_eq!(parse_landing("pane\n"), Landing::Pane);
+        assert_eq!(parse_landing("on"), Landing::Popup);
+        assert_eq!(parse_landing("popup"), Landing::Popup);
+        assert_eq!(parse_landing("off"), Landing::Window);
+        assert_eq!(parse_landing(""), Landing::Window);
+    }
+
+    #[test]
+    fn the_restore_call_carries_everything_and_quotes_nothing_twice() {
+        let held = Held {
+            pane: "%2".into(),
+            window: "@1".into(),
+            session: "$0".into(),
+            index: 3,
+            layout: "b2f1,120x40,0,0{60x40,0,0,0,59x40,61,0[59x20,61,0,1]}".into(),
+        };
+        let cmd = held.restore_cmd("/bin/omni", "/tmp/cap", Pager::Plain, false);
+        assert_eq!(
+            cmd,
+            "'/bin/omni' restore --pane '%2' --window '@1' --session '$0' \
+             --index 3 --layout 'b2f1,120x40,0,0{60x40,0,0,0,59x40,61,0[59x20,61,0,1]}' \
+             --path '/tmp/cap' --pager plain"
+        );
+        // The hook's copy is the same call, told the slot went with the pane.
+        let killed = held.restore_cmd("/bin/omni", "/tmp/cap", Pager::Nvim, true);
+        assert!(killed.ends_with("--pager nvim --killed"), "{killed}");
+        // It rides inside double quotes in the hook, single ones in sh -c.
+        assert!(!cmd.contains('"'), "{cmd}");
     }
 
     #[test]

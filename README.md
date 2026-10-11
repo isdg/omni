@@ -105,27 +105,35 @@ window is hoisted to the front and the rest keep their recency order.
 ### Capture in place
 
 ```sh
-tmux set -g @capture-overlay on     # off, the default, opens a window instead
+tmux set -g @capture-overlay pane   # or on (a popup); off, the default, opens a window
 ```
 
-With it on, `prefix j`/`J` open the capture in a **popup pinned over the pane it
-came from** — same size, same position, same first visible line — so reading
-your own scrollback costs no window and no layout. Quitting puts the pane back
-exactly as it was. The window it replaces is still one keystroke away: **`P`
-promotes** the capture to a window of its own, at the line under the cursor, for
-when a look turns into work.
+With `pane`, `prefix j`/`J` open the capture in a **real pane swapped into the
+slot of the pane it came from** — same size, same position, same first visible
+line. The live pane waits in a detached `capture-<pid>` session sized exactly
+like the slot, so it is never resized, and quitting the viewer swaps it back.
+Because the capture is an ordinary pane, the prefix and every other pane stay
+live while you read. Killing the capture pane instead (`prefix x`) still puts
+the live pane back, at the layout it had.
 
-The popup drops nvim's gutter, statusline, cmdline and `scrolloff`. That is not
-taste: each of them shifts the text against the lines it is drawn over, and the
-whole point of the mode is that the capture lands where the output was. The
-window path leaves your editor's own settings alone, as before.
+`on` opens the same view in a **popup pinned over the pane**. A popup takes all
+of the client's input, so tmux keys are dead until it closes.
 
-While a capture is up its window carries a `@capture` flag, which a status
-format can render — the name reversed, say, so the status line distinguishes the
-window you are *reading* from the one you are living in:
+In both, **`P` promotes** the capture to a window of its own, at the line under
+the cursor, for when a look turns into work. Both drop nvim's gutter,
+statusline, cmdline and `scrolloff`. That is not taste: each of them shifts the
+text against the lines it stands in for, and the whole point is that the
+capture lands where the output was. The window path leaves your editor's own
+settings alone.
+
+While a capture is up its window carries a `@capture` option holding the
+window's name from before the capture, which a status format can render —
+reversed, say, so the status line distinguishes the window you are *reading*
+from the one you are living in. Render the stored name rather than `#W`: with
+automatic-rename on, the swapped-in pane renames the window after the viewer.
 
 ```tmux
-set -g window-status-format "#I:#{?@capture,#[reverse]#W#[default],#W}"
+set -g window-status-format "#I:#{?@capture,#[reverse]#{@capture}#[default],#W}"
 ```
 
 ### Window order

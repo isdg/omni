@@ -52,6 +52,19 @@ where
     Ok(())
 }
 
+/// Run `tmux <args>` and report whether it succeeded, for the calls whose
+/// failure picks a fallback rather than ending the command.
+pub fn ok<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new("tmux")
+        .args(args)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// The chrome every omni picker wears: list on top, the input line under it,
 /// preview below — nvim's buffer-picker shape.
 ///
