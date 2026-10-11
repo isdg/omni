@@ -113,8 +113,9 @@ slot of the pane it came from** — same size, same position, same first visible
 line. The live pane waits in a detached `capture-<pid>` session sized exactly
 like the slot, so it is never resized, and quitting the viewer swaps it back.
 Because the capture is an ordinary pane, the prefix and every other pane stay
-live while you read. Killing the capture pane instead (`prefix x`) still puts
-the live pane back, at the layout it had.
+live while you read. Killing the capture instead — its pane, its window or its
+session — still puts the live pane back: into the layout it had, or as a window
+beside the one it was in.
 
 `on` opens the same view in a **popup pinned over the pane**. A popup takes all
 of the client's input, so tmux keys are dead until it closes.

@@ -105,13 +105,21 @@ enum Cmd {
         /// its own.
         #[arg(long)]
         pane: String,
-        /// The window the capture covered, its session, and the pane's index.
+        /// The window the capture covered, and its session.
         #[arg(long)]
         window: String,
         #[arg(long)]
         session: String,
+        /// The pane's neighbour in the window's pane order, when it had one.
+        #[arg(long, conflicts_with = "before")]
+        after: Option<String>,
         #[arg(long)]
-        index: u32,
+        before: Option<String>,
+        /// The window's neighbour in the session, for when it is gone too.
+        #[arg(long, conflicts_with = "before_window")]
+        after_window: Option<String>,
+        #[arg(long)]
+        before_window: Option<String>,
         /// `#{window_layout}` at capture time, for when the slot is gone.
         #[arg(long)]
         layout: String,
@@ -152,8 +160,22 @@ fn main() -> Result<()> {
         Cmd::Peek { target } => peek(&target),
         Cmd::Kill { target } => kill_window(&target),
         Cmd::Capture { pager, target } => capture(pager, target),
-        Cmd::Restore { pane, window, session, index, layout, path, pager, killed } => {
-            let held = Held { pane, window, session, index, layout };
+        Cmd::Restore {
+            pane,
+            window,
+            session,
+            after,
+            before,
+            after_window,
+            before_window,
+            layout,
+            path,
+            pager,
+            killed,
+        } => {
+            let next = Next::from_flags(after, before);
+            let next_window = Next::from_flags(after_window, before_window);
+            let held = Held { pane, window, session, next, next_window, layout };
             restore(&held, &path, pager, killed)
         }
     }
@@ -988,23 +1010,70 @@ struct Held {
     pane: String,
     window: String,
     session: String,
-    index: u32,
+    next: Option<Next>,
+    next_window: Option<Next>,
     layout: String,
+}
+
+/// The pane or window a held one sat beside, by id: an index would shift with
+/// the base index, renumber-windows, and everything closed meanwhile.
+#[derive(Debug, PartialEq)]
+enum Next {
+    After(String),
+    Before(String),
+}
+
+impl Next {
+    fn from_flags(after: Option<String>, before: Option<String>) -> Option<Next> {
+        after.map(Next::After).or(before.map(Next::Before))
+    }
+
+    /// As `restore` flags, `--after`/`--before` with `kind` appended.
+    fn flag(next: &Option<Next>, kind: &str) -> String {
+        match next {
+            Some(Next::After(id)) => format!(" --after{kind} '{id}'"),
+            Some(Next::Before(id)) => format!(" --before{kind} '{id}'"),
+            None => String::new(),
+        }
+    }
+
+    /// Run `cmd -s <pane> -t <neighbour>`, -b when it goes in front of it.
+    /// break-pane needs -a to go after; join-pane goes after by default and
+    /// has no -a.
+    fn place(next: &Option<Next>, cmd: &str, pane: &str) -> bool {
+        let after = if cmd == "break-pane" { "-a" } else { "-d" };
+        match next {
+            Some(Next::After(id)) => tmux::ok([cmd, "-d", after, "-s", pane, "-t", id]),
+            Some(Next::Before(id)) => tmux::ok([cmd, "-d", "-b", "-s", pane, "-t", id]),
+            None => false,
+        }
+    }
+}
+
+/// Where `id` sits in an order of panes or windows: after the one ahead of it,
+/// or before the one behind it when it leads. None when it is alone.
+fn neighbour(order: &[&str], id: &str) -> Option<Next> {
+    let i = order.iter().position(|p| *p == id)?;
+    match i {
+        0 => order.get(1).map(|p| Next::Before(p.to_string())),
+        _ => Some(Next::After(order[i - 1].to_string())),
+    }
 }
 
 impl Held {
     /// The `omni restore` call that puts this pane back, quoted for `sh -c`.
-    /// Nothing here can hold a single quote: ids, a number, a layout string
-    /// made of digits and `x,[]{}`, a temp path and a pager name.
+    /// Nothing here can hold a single quote: ids, a layout (tmux 3.8 writes it
+    /// as JSON, double quotes and all), a temp path and a pager name.
     fn restore_cmd(&self, exe: &str, path: &str, pager: Pager, killed: bool) -> String {
         let pager = pager.to_possible_value().map(|v| v.get_name().to_string());
         format!(
-            "'{exe}' restore --pane '{}' --window '{}' --session '{}' --index {} \
+            "'{exe}' restore --pane '{}' --window '{}' --session '{}'{}{} \
              --layout '{}' --path '{path}' --pager {}{}",
             self.pane,
             self.window,
             self.session,
-            self.index,
+            Next::flag(&self.next, ""),
+            Next::flag(&self.next_window, "-window"),
             self.layout,
             pager.unwrap_or_default(),
             if killed { " --killed" } else { "" },
@@ -1018,34 +1087,37 @@ impl Held {
 ///
 /// The pane moves to a detached session sized exactly like the slot, so it is
 /// never resized: no SIGWINCH, no reflowed scrollback, nothing to redraw. The
-/// viewer swaps it back when it quits; if the capture pane is killed instead,
-/// its after-kill-pane hook rejoins it and reapplies the layout saved here.
+/// viewer swaps it back when it quits. Killing the capture -- its pane, its
+/// window or its session -- hangs up the shell around the viewer instead, and
+/// that trap puts the pane back by the layout saved here, or as a window.
 fn in_place(pager: Pager, path: &str, pos: &str, cwd: &str, pane_id: &str) -> Result<()> {
     let q = |fmt: &str| tmux::query(["display-message", "-p", "-t", pane_id, fmt]);
-    let geom = q("#{pane_width} #{pane_height} #{pane_index} #{window_id} #{session_id} \
-                  #{window_layout}")?;
+    let geom = q("#{pane_width} #{pane_height} #{window_id} #{session_id} #{window_layout}")?;
     let f: Vec<&str> = geom.split_whitespace().collect();
-    let [w, h, index, win, session, layout] = f[..] else {
+    let [w, h, win, session, layout] = f[..] else {
         let geom = q("#{pane_width} #{pane_height} #{pane_left} #{pane_top} #{window_id}")?;
         return overlay(pager, path, pos, cwd, pane_id, &geom);
     };
-    let Ok(index) = index.parse() else {
-        let geom = q("#{pane_width} #{pane_height} #{pane_left} #{pane_top} #{window_id}")?;
-        return overlay(pager, path, pos, cwd, pane_id, &geom);
-    };
+    let panes = tmux::query(["list-panes", "-t", win, "-F", "#{pane_id}"])?;
+    let windows = tmux::query(["list-windows", "-t", session, "-F", "#{window_id}"])?;
     let held = Held {
         pane: pane_id.into(),
         window: win.to_string(),
         session: session.to_string(),
-        index,
+        next: neighbour(&panes.lines().collect::<Vec<_>>(), pane_id),
+        next_window: neighbour(&windows.lines().collect::<Vec<_>>(), win),
         layout: layout.to_string(),
     };
     let exe = std::env::current_exe()?.to_string_lossy().into_owned();
     let flag = format!("{path}.promote");
     let _ = std::fs::remove_file(&flag);
 
+    // A function, not a trap string: the restore call is full of single quotes,
+    // and a session id like $3 must not expand inside double ones. The trap has
+    // to exit, or the shell carries on to the quit path after it.
     let shell = format!(
-        "{}; {}",
+        "gone() {{ {}; exit; }}; trap gone HUP; {}; trap - HUP; {}",
+        held.restore_cmd(&exe, path, pager, true),
         viewer(pager, path, pos, &overlay_opts(&flag)),
         held.restore_cmd(&exe, path, pager, false),
     );
@@ -1075,8 +1147,6 @@ fn in_place(pager: Pager, path: &str, pos: &str, cwd: &str, pane_id: &str) -> Re
         anyhow::bail!("tmux would not start the capture pane");
     }
 
-    let hook = format!("run-shell -b \"{}\"", held.restore_cmd(&exe, path, pager, true));
-    tmux::run(["set-hook", "-p", "-t", &cap, "after-kill-pane", &hook])?;
     mark(win)?;
     // -Z: a zoomed pane stays zoomed with the capture in its place.
     tmux::run(["swap-pane", "-Z", "-s", &cap, "-t", pane_id])
@@ -1099,29 +1169,22 @@ fn restore(held: &Held, path: &str, pager: Pager, killed: bool) -> Result<()> {
         let cap = std::env::var("TMUX_PANE").unwrap_or_default();
         tmux::run(["swap-pane", "-Z", "-s", &cap, "-t", &held.pane])?;
     } else if exists(&held.window) {
-        // The slot went with the pane. Rejoin beside the pane that preceded it,
-        // so the pane order matches the saved layout, then reapply that layout.
-        // If the window changed shape meanwhile the layout no longer fits, and
-        // the pane stays joined wherever tmux put it.
-        let (before, at) = match held.index {
-            0 => (true, 0),
-            i => (false, i - 1),
-        };
-        let target = format!("{}.{at}", held.window);
-        let mut join = vec!["join-pane", "-d", "-s", &held.pane, "-t", &target];
-        if before {
-            join.push("-b");
-        }
-        if !tmux::ok(&join) {
+        // The slot went with the pane. Rejoin beside the same neighbour, so the
+        // pane order matches the saved layout, then reapply that layout. If the
+        // window changed shape meanwhile the layout no longer fits, and the pane
+        // stays joined wherever tmux put it.
+        if !Next::place(&held.next, "join-pane", &held.pane) {
             tmux::run(["join-pane", "-d", "-s", &held.pane, "-t", &held.window])?;
         }
         let _ = tmux::run(["select-layout", "-t", &held.window, &held.layout]);
         tmux::run(["select-pane", "-t", &held.pane])?;
     } else {
-        // The capture was the window's only pane and took the window with it:
-        // the pane comes back as a window of its own.
-        let to = format!("{}:", held.session);
-        tmux::run(["break-pane", "-s", &held.pane, "-t", &to])?;
+        // The window went with the capture: the pane comes back as a window,
+        // beside the window it used to follow, so the list keeps its order.
+        if !Next::place(&held.next_window, "break-pane", &held.pane) {
+            let any = format!("{}:", held.session);
+            tmux::run(["break-pane", "-d", "-s", &held.pane, "-t", &any])?;
+        }
     }
     promote_or_drop(pager, path, &held.window, &cwd, &held.pane)
 }
@@ -1412,21 +1475,41 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
             pane: "%2".into(),
             window: "@1".into(),
             session: "$0".into(),
-            index: 3,
-            layout: "b2f1,120x40,0,0{60x40,0,0,0,59x40,61,0[59x20,61,0,1]}".into(),
+            next: Some(Next::After("%1".into())),
+            next_window: Some(Next::Before("@4".into())),
+            layout: r#"{"V":2,"L":{"t":"p","w":120,"h":40,"I":"%2"}}"#.into(),
         };
         let cmd = held.restore_cmd("/bin/omni", "/tmp/cap", Pager::Plain, false);
         assert_eq!(
             cmd,
-            "'/bin/omni' restore --pane '%2' --window '@1' --session '$0' \
-             --index 3 --layout 'b2f1,120x40,0,0{60x40,0,0,0,59x40,61,0[59x20,61,0,1]}' \
-             --path '/tmp/cap' --pager plain"
+            "'/bin/omni' restore --pane '%2' --window '@1' --session '$0' --after '%1' \
+             --before-window '@4' --layout '{\"V\":2,\"L\":{\"t\":\"p\",\"w\":120,\
+             \"h\":40,\"I\":\"%2\"}}' --path '/tmp/cap' --pager plain"
         );
-        // The hook's copy is the same call, told the slot went with the pane.
+        // The trap's copy is the same call, told the slot went with the pane.
         let killed = held.restore_cmd("/bin/omni", "/tmp/cap", Pager::Nvim, true);
         assert!(killed.ends_with("--pager nvim --killed"), "{killed}");
-        // It rides inside double quotes in the hook, single ones in sh -c.
-        assert!(!cmd.contains('"'), "{cmd}");
+        // Through a real shell, every value arrives as one argument, intact.
+        let script = format!(
+            "f() {{ for a; do printf '%s\\n' \"$a\"; done; }}; {}",
+            cmd.replacen("'/bin/omni'", "f", 1)
+        );
+        let out = std::process::Command::new("sh").args(["-c", &script]).output();
+        let args = String::from_utf8(out.expect("sh").stdout).expect("utf-8");
+        assert!(args.lines().any(|a| a == held.layout), "{args}");
+        assert!(args.lines().any(|a| a == "$0"), "{args}");
+    }
+
+    #[test]
+    fn a_held_pane_remembers_its_neighbour_by_id() {
+        let order = ["%4", "%2", "%9"];
+        assert_eq!(neighbour(&order, "%2"), Some(Next::After("%4".into())));
+        assert_eq!(neighbour(&order, "%9"), Some(Next::After("%2".into())));
+        // Leading the window, it goes back in front of the pane behind it.
+        assert_eq!(neighbour(&order, "%4"), Some(Next::Before("%2".into())));
+        // Alone, there is no one to stand beside: it returns as a window.
+        assert_eq!(neighbour(&["%4"], "%4"), None);
+        assert_eq!(neighbour(&order, "%7"), None);
     }
 
     #[test]
