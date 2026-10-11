@@ -129,18 +129,14 @@ text against the lines it stands in for, and the whole point is that the
 capture lands where the output was. The window path leaves your editor's own
 settings alone.
 
-While a capture is up its window carries a `@capture` option holding the
-window's name from before the capture, which a status format can render —
-reversed, say, so the status line distinguishes the window you are *reading*
-from the one you are living in. Render the stored name rather than `#W`: with
-automatic-rename on, the swapped-in pane renames the window after the viewer.
-
-The parking window carries `@capture-held`, so it can be told apart too — here
-reversed as well, under its pane id rather than a second copy of the name:
+While a capture is up its window carries a `@capture` option, and the parking
+window `@capture-held`; both hold the window's name from before the capture.
+A status format can render them so the two never read alike — here the
+snapshot shows reversed under its pane id, and the live pane keeps the name:
 
 ```tmux
-set -g window-status-format "#I:#{?@capture,#[reverse]#{@capture}#[default],\
-#{?@capture-held,#[reverse]#{pane_id}#[default],#W}}"
+set -g window-status-format "#I:#{?@capture,#[reverse]#{pane_id}#[default],\
+#{?@capture-held,#[reverse]#{@capture-held}#[default],#W}}"
 ```
 
 ### Window order

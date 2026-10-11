@@ -941,12 +941,13 @@ fn overlay(
     promote_or_drop(pager, path, &g.win, cwd, pane_id)
 }
 
-/// Set @capture on the window to its name as it stands. The status line shows
-/// that instead of #W: with automatic-rename on, a capture pane swapped in
-/// would otherwise rename the window after the viewer.
-fn mark(win: &str) -> Result<()> {
+/// Set @capture on the window to its name as it stands, and return it. The
+/// status line can show that instead of #W: with automatic-rename on, a
+/// capture pane swapped in would otherwise rename the window after the viewer.
+fn mark(win: &str) -> Result<String> {
     let name = tmux::query(["display-message", "-p", "-t", win, "#{window_name}"])?;
-    tmux::run(["set", "-w", "-t", win, "@capture", &name])
+    tmux::run(["set", "-w", "-t", win, "@capture", &name])?;
+    Ok(name)
 }
 
 /// After the reader quits: reopen the capture as a window if P asked for one,
@@ -1107,8 +1108,9 @@ fn in_place(pager: Pager, path: &str, pos: &str, cwd: &str, pane_id: &str) -> Re
     // slot's size, or the pane parked in it would be resized to the client.
     tmux::run(["set", "-w", "-t", parking, "window-size", "manual"])?;
     tmux::run(["resize-window", "-t", parking, "-x", w, "-y", h])?;
-    tmux::run(["set", "-w", "-t", parking, "@capture-held", "1"])?;
-    mark(win)?;
+    // The parking window holds the live pane, so it carries the window's name.
+    let name = mark(win)?;
+    tmux::run(["set", "-w", "-t", parking, "@capture-held", &name])?;
     // -Z: a zoomed pane stays zoomed with the capture in its place.
     if !tmux::ok(["swap-pane", "-Z", "-s", cap, "-t", pane_id]) {
         // Nothing moved: drop the capture before its gate opens, so no trap
