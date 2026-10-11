@@ -97,29 +97,22 @@ enum Cmd {
         #[arg(long)]
         target: Option<String>,
     },
-    /// Put a pane back after its in-place capture is read; run by the capture
-    /// pane itself on quit, or by its after-kill-pane hook.
+    /// Put a pane back after its in-place capture is read; run by the shell
+    /// around the viewer, on quit or on the hangup any kill sends it.
     #[command(hide = true)]
     Restore {
-        /// The pane the capture stood in for, held meanwhile in a session of
-        /// its own.
+        /// The pane the capture stood in for, parked meanwhile in a window of
+        /// its own beside the one it came from.
         #[arg(long)]
         pane: String,
-        /// The window the capture covered, and its session.
+        /// The window the capture covered.
         #[arg(long)]
         window: String,
-        #[arg(long)]
-        session: String,
         /// The pane's neighbour in the window's pane order, when it had one.
         #[arg(long, conflicts_with = "before")]
         after: Option<String>,
         #[arg(long)]
         before: Option<String>,
-        /// The window's neighbour in the session, for when it is gone too.
-        #[arg(long, conflicts_with = "before_window")]
-        after_window: Option<String>,
-        #[arg(long)]
-        before_window: Option<String>,
         /// `#{window_layout}` at capture time, for when the slot is gone.
         #[arg(long)]
         layout: String,
@@ -160,22 +153,9 @@ fn main() -> Result<()> {
         Cmd::Peek { target } => peek(&target),
         Cmd::Kill { target } => kill_window(&target),
         Cmd::Capture { pager, target } => capture(pager, target),
-        Cmd::Restore {
-            pane,
-            window,
-            session,
-            after,
-            before,
-            after_window,
-            before_window,
-            layout,
-            path,
-            pager,
-            killed,
-        } => {
-            let next = Next::from_flags(after, before);
-            let next_window = Next::from_flags(after_window, before_window);
-            let held = Held { pane, window, session, next, next_window, layout };
+        Cmd::Restore { pane, window, after, before, layout, path, pager, killed } => {
+            let next = after.map(Next::After).or(before.map(Next::Before));
+            let held = Held { pane, window, next, layout };
             restore(&held, &path, pager, killed)
         }
     }
@@ -1004,56 +984,27 @@ fn exists(target: &str) -> bool {
         .is_ok_and(|id| !id.is_empty())
 }
 
-/// Where a pane in its capture's holding session came from, and what puts it
-/// back: the slot itself while the capture is in it, the layout once it is not.
+/// Where a parked pane came from, and what puts it back: the slot itself while
+/// the capture is in it, the layout once it is not.
 struct Held {
     pane: String,
     window: String,
-    session: String,
     next: Option<Next>,
-    next_window: Option<Next>,
     layout: String,
 }
 
-/// The pane or window a held one sat beside, by id: an index would shift with
-/// the base index, renumber-windows, and everything closed meanwhile.
+/// The pane a parked one sat beside, by id: an index would shift with
+/// pane-base-index and with every pane closed meanwhile.
 #[derive(Debug, PartialEq)]
 enum Next {
     After(String),
     Before(String),
 }
 
-impl Next {
-    fn from_flags(after: Option<String>, before: Option<String>) -> Option<Next> {
-        after.map(Next::After).or(before.map(Next::Before))
-    }
-
-    /// As `restore` flags, `--after`/`--before` with `kind` appended.
-    fn flag(next: &Option<Next>, kind: &str) -> String {
-        match next {
-            Some(Next::After(id)) => format!(" --after{kind} '{id}'"),
-            Some(Next::Before(id)) => format!(" --before{kind} '{id}'"),
-            None => String::new(),
-        }
-    }
-
-    /// Run `cmd -s <pane> -t <neighbour>`, -b when it goes in front of it.
-    /// break-pane needs -a to go after; join-pane goes after by default and
-    /// has no -a.
-    fn place(next: &Option<Next>, cmd: &str, pane: &str) -> bool {
-        let after = if cmd == "break-pane" { "-a" } else { "-d" };
-        match next {
-            Some(Next::After(id)) => tmux::ok([cmd, "-d", after, "-s", pane, "-t", id]),
-            Some(Next::Before(id)) => tmux::ok([cmd, "-d", "-b", "-s", pane, "-t", id]),
-            None => false,
-        }
-    }
-}
-
-/// Where `id` sits in an order of panes or windows: after the one ahead of it,
-/// or before the one behind it when it leads. None when it is alone.
-fn neighbour(order: &[&str], id: &str) -> Option<Next> {
-    let i = order.iter().position(|p| *p == id)?;
+/// Where `pane` sits in a window's pane order: after the pane ahead of it, or
+/// before the one behind it when it leads. None for a window's only pane.
+fn neighbour(order: &[&str], pane: &str) -> Option<Next> {
+    let i = order.iter().position(|p| *p == pane)?;
     match i {
         0 => order.get(1).map(|p| Next::Before(p.to_string())),
         _ => Some(Next::After(order[i - 1].to_string())),
@@ -1066,14 +1017,16 @@ impl Held {
     /// as JSON, double quotes and all), a temp path and a pager name.
     fn restore_cmd(&self, exe: &str, path: &str, pager: Pager, killed: bool) -> String {
         let pager = pager.to_possible_value().map(|v| v.get_name().to_string());
+        let next = match &self.next {
+            Some(Next::After(id)) => format!(" --after '{id}'"),
+            Some(Next::Before(id)) => format!(" --before '{id}'"),
+            None => String::new(),
+        };
         format!(
-            "'{exe}' restore --pane '{}' --window '{}' --session '{}'{}{} \
+            "'{exe}' restore --pane '{}' --window '{}'{next} \
              --layout '{}' --path '{path}' --pager {}{}",
             self.pane,
             self.window,
-            self.session,
-            Next::flag(&self.next, ""),
-            Next::flag(&self.next_window, "-window"),
             self.layout,
             pager.unwrap_or_default(),
             if killed { " --killed" } else { "" },
@@ -1081,84 +1034,105 @@ impl Held {
     }
 }
 
+/// The shell run in the capture pane. It waits on `gate` until omni has swapped
+/// it into place, so a viewer that dies at once cannot swap back first. A
+/// function, not a trap string: the restore call is full of single quotes. The
+/// trap has to exit, or the shell would carry on to the quit path after it.
+fn capture_shell(gate: &str, viewer: &str, killed: &str, quit: &str) -> String {
+    format!(
+        "tmux wait-for '{gate}'; gone() {{ {killed}; exit; }}; trap gone HUP; \
+         {viewer}; trap - HUP; {quit}"
+    )
+}
+
 /// Open the capture in a real pane swapped into the slot of the one it came
 /// from. Unlike the popup it takes no input from the client, so the prefix and
 /// every other pane stay live while you read.
 ///
-/// The pane moves to a detached session sized exactly like the slot, so it is
-/// never resized: no SIGWINCH, no reflowed scrollback, nothing to redraw. The
-/// viewer swaps it back when it quits. Killing the capture -- its pane, its
-/// window or its session -- hangs up the shell around the viewer instead, and
-/// that trap puts the pane back by the layout saved here, or as a window.
+/// The pane is parked in a window right after its own, in the same session, so
+/// alarms, #{session_name} and anything addressing it by session still hold.
+/// That window is sized manually to the slot, so the pane is never resized,
+/// and it closes itself once the pane is swapped back out of it. Killing the
+/// capture -- pane, window or session -- hangs up the shell around the viewer,
+/// whose trap puts the pane back by the layout saved here.
 fn in_place(pager: Pager, path: &str, pos: &str, cwd: &str, pane_id: &str) -> Result<()> {
     let q = |fmt: &str| tmux::query(["display-message", "-p", "-t", pane_id, fmt]);
-    let geom = q("#{pane_width} #{pane_height} #{window_id} #{session_id} #{window_layout}")?;
+    let geom = q("#{pane_width} #{pane_height} #{window_id} #{window_layout}")?;
     let f: Vec<&str> = geom.split_whitespace().collect();
-    let [w, h, win, session, layout] = f[..] else {
+    let [w, h, win, layout] = f[..] else {
         let geom = q("#{pane_width} #{pane_height} #{pane_left} #{pane_top} #{window_id}")?;
         return overlay(pager, path, pos, cwd, pane_id, &geom);
     };
     let panes = tmux::query(["list-panes", "-t", win, "-F", "#{pane_id}"])?;
-    let windows = tmux::query(["list-windows", "-t", session, "-F", "#{window_id}"])?;
-    let held = Held {
-        pane: pane_id.into(),
-        window: win.to_string(),
-        session: session.to_string(),
-        next: neighbour(&panes.lines().collect::<Vec<_>>(), pane_id),
-        next_window: neighbour(&windows.lines().collect::<Vec<_>>(), win),
-        layout: layout.to_string(),
-    };
-    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    let gate = format!("omni-capture-{}", std::process::id());
     let flag = format!("{path}.promote");
     let _ = std::fs::remove_file(&flag);
 
-    // A function, not a trap string: the restore call is full of single quotes,
-    // and a session id like $3 must not expand inside double ones. The trap has
-    // to exit, or the shell carries on to the quit path after it.
-    let shell = format!(
-        "gone() {{ {}; exit; }}; trap gone HUP; {}; trap - HUP; {}",
-        held.restore_cmd(&exe, path, pager, true),
-        viewer(pager, path, pos, &overlay_opts(&flag)),
-        held.restore_cmd(&exe, path, pager, false),
-    );
     let mut args: Vec<String> = vec![
-        "new-session".into(),
+        "new-window".into(),
         "-d".into(),
-        "-s".into(),
-        format!("capture-{}", std::process::id()),
-        "-x".into(),
-        w.to_string(),
-        "-y".into(),
-        h.to_string(),
+        "-a".into(),
+        "-t".into(),
+        win.into(),
         "-c".into(),
         cwd.into(),
         "-P".into(),
         "-F".into(),
-        "#{pane_id}".into(),
+        "#{window_id} #{pane_id}".into(),
     ];
     for kv in env::records(pane_id) {
         args.push("-e".into());
         args.push(kv);
     }
-    args.push(shell);
-    let cap = tmux::query(&args)?;
-    if cap.is_empty() {
+    let held = Held {
+        pane: pane_id.into(),
+        window: win.into(),
+        next: neighbour(&panes.lines().collect::<Vec<_>>(), pane_id),
+        layout: layout.into(),
+    };
+    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    args.push(capture_shell(
+        &gate,
+        &viewer(pager, path, pos, &overlay_opts(&flag)),
+        &held.restore_cmd(&exe, path, pager, true),
+        &held.restore_cmd(&exe, path, pager, false),
+    ));
+    let made = tmux::query(&args)?;
+    let Some((parking, cap)) = made.split_once(' ') else {
         let _ = std::fs::remove_file(path);
-        anyhow::bail!("tmux would not start the capture pane");
-    }
+        anyhow::bail!("tmux would not open the capture pane");
+    };
 
+    // Manual size first: the swap must find the parking window already the
+    // slot's size, or the pane parked in it would be resized to the client.
+    tmux::run(["set", "-w", "-t", parking, "window-size", "manual"])?;
+    tmux::run(["resize-window", "-t", parking, "-x", w, "-y", h])?;
+    tmux::run(["set", "-w", "-t", parking, "@capture-held", "1"])?;
     mark(win)?;
     // -Z: a zoomed pane stays zoomed with the capture in its place.
-    tmux::run(["swap-pane", "-Z", "-s", &cap, "-t", pane_id])
+    if !tmux::ok(["swap-pane", "-Z", "-s", cap, "-t", pane_id]) {
+        // Nothing moved: drop the capture before its gate opens, so no trap
+        // or restore ever runs for it.
+        let _ = tmux::run(["kill-window", "-t", parking]);
+        let _ = tmux::run(["set", "-wu", "-t", win, "@capture"]);
+        let _ = std::fs::remove_file(path);
+        anyhow::bail!("tmux would not swap the capture into place");
+    }
+    tmux::run(["wait-for", "-S", &gate])
 }
 
-/// Put a held pane back where its capture stood, then promote or drop the text.
+/// Put a parked pane back where its capture stood, then promote or drop the
+/// text.
 fn restore(held: &Held, path: &str, pager: Pager, killed: bool) -> Result<()> {
     let _ = tmux::run(["set", "-wu", "-t", &held.window, "@capture"]);
-    let cwd = tmux::query(["display-message", "-p", "-t", &held.pane, "#{pane_current_path}"])
-        .unwrap_or_default();
+    let here = tmux::query([
+        "display-message", "-p", "-t", &held.pane, "#{window_id} #{pane_current_path}",
+    ])
+    .unwrap_or_default();
+    // A parked pane knows its window, so its id never has to travel.
+    let (parked, cwd) = here.split_once(' ').unwrap_or_default();
     if !exists(&held.pane) {
-        // The pane ended while it was held; there is nothing to put back.
+        // The pane ended while it was parked; there is nothing to put back.
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{path}.promote"));
         return Ok(());
@@ -1173,20 +1147,26 @@ fn restore(held: &Held, path: &str, pager: Pager, killed: bool) -> Result<()> {
         // pane order matches the saved layout, then reapply that layout. If the
         // window changed shape meanwhile the layout no longer fits, and the pane
         // stays joined wherever tmux put it.
-        if !Next::place(&held.next, "join-pane", &held.pane) {
+        let joined = match &held.next {
+            Some(Next::After(id)) => tmux::ok(["join-pane", "-d", "-s", &held.pane, "-t", id]),
+            Some(Next::Before(id)) => {
+                tmux::ok(["join-pane", "-d", "-b", "-s", &held.pane, "-t", id])
+            }
+            None => false,
+        };
+        if !joined {
             tmux::run(["join-pane", "-d", "-s", &held.pane, "-t", &held.window])?;
         }
         let _ = tmux::run(["select-layout", "-t", &held.window, &held.layout]);
         tmux::run(["select-pane", "-t", &held.pane])?;
     } else {
-        // The window went with the capture: the pane comes back as a window,
-        // beside the window it used to follow, so the list keeps its order.
-        if !Next::place(&held.next_window, "break-pane", &held.pane) {
-            let any = format!("{}:", held.session);
-            tmux::run(["break-pane", "-d", "-s", &held.pane, "-t", &any])?;
-        }
+        // The window went with the capture. The parking window already sits
+        // where it was, so it simply stops being one and takes over.
+        let _ = tmux::run(["set", "-wu", "-t", parked, "window-size"]);
+        let _ = tmux::run(["set", "-wu", "-t", parked, "@capture-held"]);
+        return promote_or_drop(pager, path, parked, cwd, &held.pane);
     }
-    promote_or_drop(pager, path, &held.window, &cwd, &held.pane)
+    promote_or_drop(pager, path, &held.window, cwd, &held.pane)
 }
 
 /// The buffer line a capture should open on: the pane's first visible line, so
@@ -1474,18 +1454,10 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
         let held = Held {
             pane: "%2".into(),
             window: "@1".into(),
-            session: "$0".into(),
             next: Some(Next::After("%1".into())),
-            next_window: Some(Next::Before("@4".into())),
             layout: r#"{"V":2,"L":{"t":"p","w":120,"h":40,"I":"%2"}}"#.into(),
         };
         let cmd = held.restore_cmd("/bin/omni", "/tmp/cap", Pager::Plain, false);
-        assert_eq!(
-            cmd,
-            "'/bin/omni' restore --pane '%2' --window '@1' --session '$0' --after '%1' \
-             --before-window '@4' --layout '{\"V\":2,\"L\":{\"t\":\"p\",\"w\":120,\
-             \"h\":40,\"I\":\"%2\"}}' --path '/tmp/cap' --pager plain"
-        );
         // The trap's copy is the same call, told the slot went with the pane.
         let killed = held.restore_cmd("/bin/omni", "/tmp/cap", Pager::Nvim, true);
         assert!(killed.ends_with("--pager nvim --killed"), "{killed}");
@@ -1496,8 +1468,21 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
         );
         let out = std::process::Command::new("sh").args(["-c", &script]).output();
         let args = String::from_utf8(out.expect("sh").stdout).expect("utf-8");
-        assert!(args.lines().any(|a| a == held.layout), "{args}");
-        assert!(args.lines().any(|a| a == "$0"), "{args}");
+        let want = [
+            "restore", "--pane", "%2", "--window", "@1", "--after", "%1",
+            "--layout", &held.layout, "--path", "/tmp/cap", "--pager", "plain",
+        ];
+        assert_eq!(args.lines().collect::<Vec<_>>(), want);
+    }
+
+    #[test]
+    fn the_viewer_waits_for_the_swap_and_a_kill_never_falls_through() {
+        let sh = capture_shell("g1", "nvim f", "omni restore --killed", "omni restore");
+        let gate = sh.find("tmux wait-for 'g1'").expect("gate");
+        let trap = sh.find("trap gone HUP").expect("trap");
+        let view = sh.find("nvim f").expect("viewer");
+        assert!(gate < trap && trap < view, "{sh}");
+        assert!(sh.contains("gone() { omni restore --killed; exit; }"), "{sh}");
     }
 
     #[test]

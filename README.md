@@ -110,12 +110,14 @@ tmux set -g @capture-overlay pane   # or on (a popup); off, the default, opens a
 
 With `pane`, `prefix j`/`J` open the capture in a **real pane swapped into the
 slot of the pane it came from** — same size, same position, same first visible
-line. The live pane waits in a detached `capture-<pid>` session sized exactly
-like the slot, so it is never resized, and quitting the viewer swaps it back.
-Because the capture is an ordinary pane, the prefix and every other pane stay
-live while you read. Killing the capture instead — its pane, its window or its
-session — still puts the live pane back: into the layout it had, or as a window
-beside the one it was in.
+line. The live pane is parked in a window right after its own, in the same
+session, sized manually to the slot so it is never resized; alarms and anything
+that addresses it by session keep working. Quitting the viewer swaps it back and
+the parking window closes itself. Because the capture is an ordinary pane, the
+prefix and every other pane stay live while you read. Killing the capture
+instead — its pane, its window or its session — still puts the live pane back:
+into the layout it had, or, when the window went too, the parking window simply
+takes its place.
 
 `on` opens the same view in a **popup pinned over the pane**. A popup takes all
 of the client's input, so tmux keys are dead until it closes.
@@ -133,8 +135,11 @@ reversed, say, so the status line distinguishes the window you are *reading*
 from the one you are living in. Render the stored name rather than `#W`: with
 automatic-rename on, the swapped-in pane renames the window after the viewer.
 
+The parking window carries `@capture-held`, so it can be told apart too:
+
 ```tmux
-set -g window-status-format "#I:#{?@capture,#[reverse]#{@capture}#[default],#W}"
+set -g window-status-format \
+  "#I:#{?@capture,#[reverse]#{@capture}#[default],#{?@capture-held,(#W),#W}}"
 ```
 
 ### Window order
