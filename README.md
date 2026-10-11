@@ -135,11 +135,12 @@ reversed, say, so the status line distinguishes the window you are *reading*
 from the one you are living in. Render the stored name rather than `#W`: with
 automatic-rename on, the swapped-in pane renames the window after the viewer.
 
-The parking window carries `@capture-held`, so it can be told apart too:
+The parking window carries `@capture-held`, so it can be told apart too — here
+reversed as well, under its pane id rather than a second copy of the name:
 
 ```tmux
-set -g window-status-format \
-  "#I:#{?@capture,#[reverse]#{@capture}#[default],#{?@capture-held,(#W),#W}}"
+set -g window-status-format "#I:#{?@capture,#[reverse]#{@capture}#[default],\
+#{?@capture-held,#[reverse]#{pane_id}#[default],#W}}"
 ```
 
 ### Window order
