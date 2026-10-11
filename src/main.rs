@@ -5,7 +5,8 @@
 //!   omni content   fuzzy-search this session: screen + scrollback  (prefix a)
 //!                  --all: every session, not just this one         (prefix A)
 //!   omni capture   this pane's scrollback, to read      (prefix j/J/P)
-//!                  in a window, a popup over the pane, or the pane's own slot
+//!                  in a window, a popup or floating pane over the pane,
+//!                  or the pane's own slot
 //!
 //! The `.tmux` bindings are one-liners that call these; the per-prompt env
 //! snapshot that `capture` consumes stays in zsh (see zsh/omni.zsh).
@@ -86,8 +87,9 @@ enum Cmd {
     /// Capture the current pane's scrollback and open it to read.
     ///
     /// Lands in a new window; with `tmux set -g @capture-overlay pane` in a
-    /// pane swapped into the slot of the one it came from, or with `on` in a
-    /// popup pinned over it. Either way P promotes it to a window.
+    /// pane swapped into the slot of the one it came from, with `float` in a
+    /// floating pane over it (tmux 3.8), or with `on` in a popup pinned over
+    /// it. Every way, P promotes it to a window.
     Capture {
         /// Viewer for the captured text.
         #[arg(long, value_enum, default_value_t = Pager::Nvim)]
@@ -732,6 +734,7 @@ fn capture(pager: Pager) -> Result<()> {
     // you were reading. Off, the default, is the window below.
     match landing() {
         Landing::Pane => return in_place(pager, &path, &pos, &cwd, &pane_id),
+        Landing::Float => return floating(pager, &path, &pos, &cwd, &pane_id),
         Landing::Popup => {
             let geom = dm("#{pane_width} #{pane_height} #{pane_left} #{pane_top} #{window_id}")?;
             return overlay(pager, &path, &pos, &cwd, &pane_id, &geom);
@@ -759,6 +762,7 @@ enum Landing {
     Window,
     Popup,
     Pane,
+    Float,
 }
 
 /// Where `@capture-overlay` says a capture lands.
@@ -775,6 +779,7 @@ fn landing() -> Landing {
 fn parse_landing(v: &str) -> Landing {
     match v.trim() {
         "pane" => Landing::Pane,
+        "float" => Landing::Float,
         "on" | "popup" => Landing::Popup,
         _ => Landing::Window,
     }
@@ -904,6 +909,56 @@ fn overlay(
     let shown = tmux::run(&args);
     tmux::run(["set", "-wu", "-t", &g.win, "@capture"])?;
     shown?;
+    promote_or_drop(pager, path, &g.win, cwd, pane_id)
+}
+
+/// The popup's view in a borderless floating pane over the pane (tmux 3.8): the
+/// prefix and other panes stay live and nothing leaves the layout. -A keeps it
+/// above a zoom; -W holds this process until it closes, then P is honoured.
+fn floating(pager: Pager, path: &str, pos: &str, cwd: &str, pane_id: &str) -> Result<()> {
+    let geom = tmux::query([
+        "display-message", "-p", "-t", pane_id,
+        "#{pane_width} #{pane_height} #{pane_left} #{pane_top} #{window_id}",
+    ])?;
+    let Some(g) = parse_geom(&geom) else {
+        return overlay(pager, path, pos, cwd, pane_id, &geom);
+    };
+    let flag = format!("{path}.promote");
+    let _ = std::fs::remove_file(&flag);
+
+    let mut args: Vec<String> = vec![
+        "new-pane".into(),
+        "-W".into(),
+        "-A".into(),
+        "-B".into(),
+        "none".into(),
+        "-t".into(),
+        pane_id.into(),
+        "-c".into(),
+        cwd.into(),
+        "-x".into(),
+        g.w,
+        "-y".into(),
+        g.h,
+        "-X".into(),
+        g.x,
+        "-Y".into(),
+        g.y,
+    ];
+    for kv in env::records(pane_id) {
+        args.push("-e".into());
+        args.push(kv);
+    }
+    args.push(viewer(pager, path, pos, &overlay_opts(&flag)));
+
+    mark(&g.win)?;
+    let shown = tmux::run(&args);
+    tmux::run(["set", "-wu", "-t", &g.win, "@capture"])?;
+    shown?;
+    // Focus went to the capture; give it back to the pane it covered.
+    if exists(pane_id) {
+        let _ = tmux::run(["select-pane", "-t", pane_id]);
+    }
     promote_or_drop(pager, path, &g.win, cwd, pane_id)
 }
 
@@ -1411,6 +1466,7 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
     #[test]
     fn on_keeps_meaning_the_popup_and_pane_is_its_own_landing() {
         assert_eq!(parse_landing("pane\n"), Landing::Pane);
+        assert_eq!(parse_landing("float"), Landing::Float);
         assert_eq!(parse_landing("on"), Landing::Popup);
         assert_eq!(parse_landing("popup"), Landing::Popup);
         assert_eq!(parse_landing("off"), Landing::Window);

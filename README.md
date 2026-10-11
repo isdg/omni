@@ -105,7 +105,7 @@ window is hoisted to the front and the rest keep their recency order.
 ### Capture in place
 
 ```sh
-tmux set -g @capture-overlay pane   # or on (a popup); off, the default, opens a window
+tmux set -g @capture-overlay float  # or pane, or on (a popup); off, the default, opens a window
 ```
 
 With `pane`, `prefix j`/`J` open the capture in a **real pane swapped into the
@@ -118,6 +118,10 @@ prefix and every other pane stay live while you read. Killing the capture
 instead — its pane, its window or its session — still puts the live pane back:
 into the layout it had, or, when the window went too, the parking window simply
 takes its place.
+
+`float` (tmux 3.8) opens the same view in a **borderless floating pane laid
+over the pane**. It is a real pane too, so the prefix stays live, and nothing is
+parked or swapped: quitting closes it and focus returns to the pane beneath.
 
 `on` opens the same view in a **popup pinned over the pane**. A popup takes all
 of the client's input, so tmux keys are dead until it closes.
