@@ -36,7 +36,8 @@ enum Cmd {
         #[arg(long)]
         list: bool,
         /// Only windows with an alarm on them, each row led by its state:
-        /// [!] bell, [~] stopped, [*] running, [.] armed but not yet tripped.
+        /// [!] bell, [✓]/[✗] command finished ok/failed, [~] stopped,
+        /// [*] running, [.] armed but not yet tripped.
         /// The full list is what the picker shows without this; here the
         /// question is what you set an alarm on and whether it has gone off.
         #[arg(long)]
@@ -332,7 +333,7 @@ fn window_list(alerts: bool, scope: Option<&str>) -> Result<String> {
         "#{e|+:#{@seen},0} #{window_activity} #{session_last_attached} #{session_name}:#{window_index}\t#{window_name}\t\
          #{pane_title}\t[#{window_panes}p #{pane_current_command}]\t#{pane_current_path}\t\
          #{window_bell_flag}#{window_silence_flag}#{window_activity_flag}\t\
-         #{monitor-activity}#{?#{monitor-silence},1,0}";
+         #{monitor-activity}#{?#{monitor-silence},1,0}#{?@alert-cmd,1,0}\t#{@done}";
     let raw = match scope {
         Some(s) => tmux::query(["list-windows", "-t", s, "-F", FMT])?,
         None => tmux::query(["list-windows", "-a", "-F", FMT])?,
@@ -341,12 +342,12 @@ fn window_list(alerts: bool, scope: Option<&str>) -> Result<String> {
     Ok(align_columns(&if alerts { mark_alerts(&body) } else { drop_alarm_cols(&body) }))
 }
 
-/// The two trailing alarm columns are for mark_alerts, not for the eye.
+/// The three trailing alarm columns are for mark_alerts, not for the eye.
 fn drop_alarm_cols(body: &str) -> String {
     body.lines()
         .map(|l| {
             let mut cols: Vec<&str> = l.split('\t').collect();
-            cols.truncate(cols.len().saturating_sub(2));
+            cols.truncate(cols.len().saturating_sub(3));
             cols.join("\t")
         })
         .collect::<Vec<_>>()
@@ -368,15 +369,21 @@ fn drop_alarm_cols(body: &str) -> String {
 /// it is the one the status line cannot show — with no flag raised there is
 /// nothing for its styling to hook onto, so an armed window looks exactly like
 /// an unarmed one there. Which is most of why this mode is worth having.
+///
+/// `@done` is the exit status the OSC 133 hook records (12-alerts.conf), the
+/// one fact the monitors cannot give, so it outranks them; only a bell beats it.
 fn mark_alerts(body: &str) -> String {
     body.lines()
         .filter_map(|l| {
             let mut cols: Vec<&str> = l.split('\t').collect();
+            let done = cols.pop()?;
             let armed = cols.pop()?;
             let flags = cols.pop()?;
             let mut f = flags.chars();
             let state = match (f.next(), f.next(), f.next()) {
                 (Some('1'), _, _) => "[!]",
+                _ if done == "0" => "[✓]",
+                _ if !done.is_empty() => "[✗]",
                 (_, Some('1'), _) => "[~]",
                 (_, _, Some('1')) => "[*]",
                 _ if armed.contains('1') => "[.]",
@@ -1251,7 +1258,8 @@ pub fn windows_header() -> String {
 /// markers, since [.] for "armed, nothing yet" is not guessable.
 pub fn alerts_header() -> String {
     format!(
-        " alerts · {} · [!] bell [~] stopped [*] running [.] waiting · enter jump ",
+        " alerts · {} · [!] bell [✓] done [✗] failed [~] stopped [*] running \
+         [.] waiting · enter jump ",
         order_label(order_mode())
     )
 }
@@ -1363,13 +1371,14 @@ mod tests {
 
     #[test]
     fn alerts_keep_only_alarmed_rows_and_lead_with_state() {
-        // flags column is bell/silence/activity; armed is monitor-a/monitor-s.
+        // flags column is bell/silence/activity; armed is monitor-a/monitor-s/
+        // @alert-cmd; the last is @done.
         let body = "\
-a:1\tzsh\ttitle\t[1p zsh]\t/p\t100\t00\n\
-a:2\tzsh\ttitle\t[1p zsh]\t/p\t010\t01\n\
-a:3\tzsh\ttitle\t[1p zsh]\t/p\t001\t10\n\
-a:4\tzsh\ttitle\t[1p zsh]\t/p\t000\t01\n\
-a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
+a:1\tzsh\ttitle\t[1p zsh]\t/p\t100\t000\t\n\
+a:2\tzsh\ttitle\t[1p zsh]\t/p\t010\t010\t\n\
+a:3\tzsh\ttitle\t[1p zsh]\t/p\t001\t100\t\n\
+a:4\tzsh\ttitle\t[1p zsh]\t/p\t000\t010\t\n\
+a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t000\t";
         let out = mark_alerts(body);
         let states: Vec<&str> = out.lines().map(|l| l.split('\t').next().unwrap()).collect();
         // a:5 is neither flagged nor armed and is gone; the rest lead with state.
@@ -1381,13 +1390,30 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t00";
     #[test]
     fn silence_outranks_activity_when_both_flags_stand() {
         // Both raised: the window has stopped, which is the newer fact.
-        let body = "a:1\tzsh\tt\t[1p zsh]\t/p\t011\t11";
+        let body = "a:1\tzsh\tt\t[1p zsh]\t/p\t011\t110\t";
         assert!(mark_alerts(body).starts_with("[~]"));
     }
 
     #[test]
+    fn finished_command_outranks_monitors_but_not_a_bell() {
+        let row = |flags: &str, done: &str| {
+            format!("a:1\tzsh\tt\t[1p zsh]\t/p\t{flags}\t000\t{done}")
+        };
+        assert!(mark_alerts(&row("011", "0")).starts_with("[✓]"));
+        assert!(mark_alerts(&row("010", "2")).starts_with("[✗]"));
+        assert!(mark_alerts(&row("000", "130")).starts_with("[✗]"));
+        assert!(mark_alerts(&row("100", "0")).starts_with("[!]"));
+    }
+
+    #[test]
+    fn pending_command_alert_counts_as_armed() {
+        let body = "a:1\tzsh\tt\t[1p zsh]\t/p\t000\t001\t";
+        assert!(mark_alerts(body).starts_with("[.]"));
+    }
+
+    #[test]
     fn plain_mode_drops_the_alarm_columns() {
-        let body = "a:1\tzsh\tt\t[1p zsh]\t/p\t000\t00";
+        let body = "a:1\tzsh\tt\t[1p zsh]\t/p\t000\t000\t0";
         assert_eq!(drop_alarm_cols(body), "a:1\tzsh\tt\t[1p zsh]\t/p");
     }
 
