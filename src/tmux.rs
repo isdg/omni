@@ -85,8 +85,8 @@ where
 /// FIRST, so a caller that repeats an option still wins: fzf takes the last.
 const STYLE: [&str; 9] = [
     // M-j labels every visible row and the `jump` event takes the landing as the
-    // selection: fzf's own EasyMotion. Alt keeps space in the query and leaves
-    // ctrl-j on capture. Here, not the shared opts file, so it travels with omni.
+    // selection: fzf's own EasyMotion. Alt keeps space in the query and ctrl-j
+    // as fzf's down. Here, not the shared opts file, so it travels with omni.
     "--bind=alt-j:jump,jump:accept",
     // Bottom-up, like nvim's Buffers: the first match sits against the prompt and
     // the list grows upward, so a short list stays under your cursor instead of
