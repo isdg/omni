@@ -92,10 +92,6 @@ enum Cmd {
         /// Viewer for the captured text.
         #[arg(long, value_enum, default_value_t = Pager::Nvim)]
         pager: Pager,
-        /// Capture this window/pane target instead of the current pane, first
-        /// switching to it. Used by the picker's ctrl-j binding.
-        #[arg(long)]
-        target: Option<String>,
     },
     /// Put a pane back after its in-place capture is read; run by the shell
     /// around the viewer, on quit or on the hangup any kill sends it.
@@ -152,7 +148,7 @@ fn main() -> Result<()> {
         Cmd::Content { all } => content(all),
         Cmd::Peek { target } => peek(&target),
         Cmd::Kill { target } => kill_window(&target),
-        Cmd::Capture { pager, target } => capture(pager, target),
+        Cmd::Capture { pager } => capture(pager),
         Cmd::Restore { pane, window, after, before, layout, path, pager, killed } => {
             let next = after.map(Next::After).or(before.map(Next::Before));
             let held = Held { pane, window, next, layout };
@@ -203,9 +199,6 @@ fn windows(list: bool, alerts: bool, session: bool) -> Result<()> {
         if session { " --session" } else { "" },
     );
     let kill = format!("--bind=ctrl-x:execute-silent({exe} kill {tgt})+reload({exe} windows --list{mode})");
-    // ctrl-j captures the highlighted window's pane just like prefix j: switch to
-    // it, then open its scrollback in nvim. +abort leaves the picker afterward.
-    let capture = format!("--bind=ctrl-j:execute-silent({exe} capture --pager nvim --target {tgt})+abort");
     // `omni peek` renders the pane: shells bottom-aligned (recent output), but
     // alternate-screen TUIs (k9s/htop/less/nvim) top-down, since they paint from
     // the top and leave the bottom blank — a plain `tail` would show emptiness.
@@ -227,7 +220,6 @@ fn windows(list: bool, alerts: bool, session: bool) -> Result<()> {
             &preview,
             "--preview-window=down,55%,border-top",
             &kill,
-            &capture,
         ],
         input,
     )? {
@@ -710,30 +702,8 @@ fn copy_position(hist: i64, height: i64, n: i64) -> (i64, i64) {
 
 /// Capture scrollback, strip OSC-8 hyperlinks, re-apply the pane's exported env,
 /// and open the result in nvim/less at the pane's current scroll position.
-///
-/// `target` (ctrl-j in the window picker) captures that window's active pane and
-/// switches to it first, so the capture opens in its session exactly as pressing
-/// prefix j after jumping there would. Without it, the current pane is used.
-fn capture(pager: Pager, target: Option<String>) -> Result<()> {
-    // Enter the picked window first; the new capture window then lands in its
-    // session and reads its scrollback below via the same `-t` target.
-    if let Some(t) = &target {
-        tmux::run(["switch-client", "-t", t])?;
-    }
-    // `-t <target>` steers every read at the picked pane; empty = current pane.
-    let tflag: &[&str] = match &target {
-        Some(t) => &["-t", t.as_str()],
-        None => &[],
-    };
-
-    let dm = |fmt: &str| {
-        let args: Vec<&str> = ["display-message", "-p"]
-            .into_iter()
-            .chain(tflag.iter().copied())
-            .chain([fmt])
-            .collect();
-        tmux::query(args)
-    };
+fn capture(pager: Pager) -> Result<()> {
+    let dm = |fmt: &str| tmux::query(["display-message", "-p", fmt]);
 
     let disp = dm("#{history_size} #{scroll_position}")?;
     let mut it = disp.split_whitespace();
@@ -750,11 +720,7 @@ fn capture(pager: Pager, target: Option<String>) -> Result<()> {
         Pager::Plain => "-p",
         _ => "-pe",
     };
-    let cap_args: Vec<&str> = ["capture-pane", cap_flag, "-S", "-"]
-        .into_iter()
-        .chain(tflag.iter().copied())
-        .collect();
-    let raw = tmux::query_bytes(cap_args)?;
+    let raw = tmux::query_bytes(["capture-pane", cap_flag, "-S", "-"])?;
     let cleaned = strip_osc8(&raw);
 
     let path = std::env::temp_dir().join(format!("tmux-pane.{}", std::process::id()));
@@ -1221,7 +1187,7 @@ pub fn order_label(o: Order) -> &'static str {
 /// The window picker's one header line: active order first, then the keys.
 pub fn windows_header() -> String {
     format!(
-        " {} · enter jump · ctrl-g order · ctrl-x kill · ctrl-j capture ",
+        " {} · enter jump · ctrl-g order · ctrl-x kill ",
         order_label(order_mode())
     )
 }
