@@ -43,7 +43,7 @@ run-shell 'OMNI="$(command -v omni || echo "$HOME/.cargo/bin/omni")"; \
 
 | Key | Does |
 |---|---|
-| `prefix b` | fuzzy-jump to any window across all sessions, most-recently-active first; `ctrl-g` toggles to session order (fzf popup, live preview) |
+| `prefix b` | fuzzy-jump to any window across all sessions, most-recently-visited first; `ctrl-g` cycles to session and recency order (fzf popup, live preview) |
 | `prefix a` | fuzzy-search the *content* of every window **in this session** — screen and scrollback — and jump to the matched **line** |
 | `prefix A` | same as `a`, over **every session** rather than just this one |
 | `prefix P` | capture current pane's scrollback, open in `less` |
@@ -145,9 +145,9 @@ set -g window-status-format "#I:#{?@capture,#[reverse]#{pane_id}#[default],\
 
 ### Window order
 
-The window picker opens **recency first**, and `ctrl-g` cycles it through
-**visited** and then **session order** (tmux's own: session name, then window
-index). The header names the active one, and the choice persists.
+The window picker opens **visited first**, and `ctrl-g` cycles it through
+**session order** (tmux's own: session name, then window index) and then
+**recency**. The header names the active one, and the choice persists.
 
 Recency sorts on `#{window_activity}`, then on the session's last-attached time.
 The second key is not decoration: any pane running an animated TUI — a Claude

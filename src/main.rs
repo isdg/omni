@@ -46,7 +46,8 @@ enum Cmd {
         #[arg(long)]
         session: bool,
     },
-    /// Show or flip the window picker's order: recency (default) or session.
+    /// Show or flip the window picker's order: visited (default), session or
+    /// recency.
     /// The choice persists, so ctrl-g's reload comes back in the new order.
     Sort {
         /// Flip to the other order and print the new one.
@@ -1227,11 +1228,11 @@ fn top_line(hist: i64, scroll: Option<i64>) -> i64 {
 /// not survive the reload it triggers.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Order {
-    /// Most recently active first. The default: it answers "where was I?".
+    /// Most recently active first: which window last made output.
     Recency,
-    /// Last *visited* first, stamped by the select hook. Answers "where was I?"
-    /// truthfully, which recency cannot: `#{window_activity}` times output, so a
-    /// chatty pane outranks the window you were reading a second ago.
+    /// Last *visited* first, stamped by the select hook. The default: it
+    /// answers "where was I?" truthfully, which recency cannot: a chatty pane
+    /// restamps `#{window_activity}` and outranks the window you were reading.
     Visited,
     /// tmux's own order — session name, then window index. Stable and
     /// predictable, which is what you want when you know the name you are after.
@@ -1291,10 +1292,16 @@ fn order_path() -> String {
 }
 
 pub fn order_mode() -> Order {
-    match std::fs::read_to_string(order_path()).as_deref().map(str::trim) {
-        Ok("session") => Order::Session,
-        Ok("visited") => Order::Visited,
-        _ => Order::Recency,
+    order_from(std::fs::read_to_string(order_path()).as_deref().ok())
+}
+
+/// The order a persisted word names; nothing on disk, or a word this build
+/// does not know, reads as the default.
+fn order_from(word: Option<&str>) -> Order {
+    match word.map(str::trim) {
+        Some("session") => Order::Session,
+        Some("recency") => Order::Recency,
+        _ => Order::Visited,
     }
 }
 
@@ -1760,6 +1767,14 @@ a:5\tzsh\ttitle\t[1p zsh]\t/p\t000\t000\t";
             strip_sort_keys(raw, Order::Visited),
             strip_sort_keys(raw, Order::Recency)
         );
+    }
+
+    #[test]
+    fn visited_is_the_order_until_another_is_chosen() {
+        assert!(order_from(None) == Order::Visited);
+        assert!(order_from(Some("bogus")) == Order::Visited);
+        assert!(order_from(Some("recency\n")) == Order::Recency);
+        assert!(order_from(Some("session")) == Order::Session);
     }
 
     #[test]
